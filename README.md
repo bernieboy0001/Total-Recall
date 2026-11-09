@@ -152,13 +152,25 @@ is not `ALLOW`; **503** when the key wallet is unconfigured.
 | `POST /api/payment/authorize` | Gate → authorization / dry-run (403 if not in policy) |
 | `POST /api/payment/execute` | Gate → real 0.01 SUI transfer + writes `advance` memory |
 
-## Verified locally (mock mode)
+## Verified end-to-end (mock and live Walrus mainnet)
+
+Mock mode:
 
 - `GET /api/credit/state` → 15 memories, `alice_to_bob=39.0`, `bob_to_alice=1.5`, fingerprint `5ebca0738a427f66…`
 - evaluate `bob_to_alice @ 25` → `BLOCK`; payment authorize → `403`
 - memory off → both limits `10.0`, verdict `BLOCK` @ 25
 - record repayment → `39.0 → 43.5`; memory off ↔ on decision re-evaluates in place
 - `reset-mock` → returns to `39.0 / 15` and the same fingerprint
+
+Live Walrus (mainnet, namespace `credit-demo`):
+
+- Seeded the 15 memories via `POST /api/credit/seed`; real blob IDs returned
+- `GET /api/credit/state` → 15 memories, limits `39.0 / 1.5`, fingerprint `234d408f627f42c6…`
+- Killed and restarted the backend → same 15 blobs recalled, **identical fingerprint**, same limits — the core "rebuilt from Walrus" claim
+
+Note: seeding is idempotent (dedupe + idempotency keys), so re-calling `/api/credit/seed` never duplicates.
+The seed handler runs to completion server-side even if your HTTP client disconnects — re-read
+`/api/credit/state` before retrying.
 
 ## Limitations & honest notes
 
