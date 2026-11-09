@@ -183,9 +183,16 @@ Live Walrus (mainnet, namespace `credit-demo`):
 
 Live Walrus (testnet relayer, namespace `credit-demo`, testnet MemWalAccount):
 
-- Seeded the 15 memories; same limits `39.0 / 1.5`
-- Fingerprint `21468161e66a357b…` — stable across a backend restart
-- Payment rail runs against `https://sui-testnet.gateway.tatum.io`; needs `TATUM_API_KEY` for dry-run/execute and testnet SUI for the agent wallet
+- `POST /api/credit/seed` → 15 real testnet blobs; limits `39.0 / 1.5`
+- Fingerprint `21468161e66a357b…` — identical across a backend kill+restart
+- Memory writes, decisions, ledger and fingerprint flows all behave identically to mainnet
+
+Sui payment rail, verified on testnet:
+
+- Tatum's Sui gateways are GraphQL-only (`sui-testnet.gateway.tatum.io/graphql`) — `sui-payment.mjs` uses `SuiGraphQLClient` against it; `suix_*` JSON-RPC returns 404 there
+- Testnet agent wallet holds SUI (faucet-funded); balances render correctly via Tatum
+- `POST /api/payment/authorize` (ALLOW case) → `mode: dry-run`, Tatum simulateTransaction returned `success: true` (~0.002 SUI gas)
+- Restart-verifiability and all other verified flows remain as described above
 
 Note: seeding is idempotent (dedupe + idempotency keys), so re-calling `/api/credit/seed` never duplicates.
 The seed handler runs to completion server-side even if your HTTP client disconnects — re-read
@@ -194,6 +201,7 @@ The seed handler runs to completion server-side even if your HTTP client disconn
 ## Limitations & honest notes
 
 - **Mock mode is not persistent** and its blob IDs are `mockblob…` hashes — the restart proof only holds with live Walrus credentials.
-- Sui JSON-RPC on Tatum mainnet is on the deprecation path; if `sui_*` methods start returning errors, switch `SUI_NETWORK`/client to Tatum's gRPC endpoints.
+- Tatum's Sui gateways speak **GraphQL** only — the payment rail deliberately uses `SuiGraphQLClient` against them. Direct fullnode JSON-RPC (`sui_*`) is dead on public mainnet since the Sui deprecation.
+- Tatum API keys are network-bound: the `TATUM_API_KEY` for testnet only works against `sui-testnet.gateway.tatum.io`. A mainnet key is rejected there and vice-versa.
 - Seed timestamps are generated relative to seed time so the 7-day recency bonus stays meaningful; amounts in scratch demos feed the recency window unchanged.
 - No authentication on `/api` — this is a hackathon demo, not a multi-tenant service.

@@ -1,6 +1,7 @@
 import { Transaction } from '@mysten/sui/transactions'
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519'
-import { MissingApiKeyError, tatumRpc } from './tatum-client.mjs'
+import { SuiGraphQLClient } from '@mysten/sui/graphql'
+import { MissingApiKeyError, tatumGatewayUrl } from './tatum-client.mjs'
 
 const SUI_COIN_TYPE = '0x2::sui::SUI'
 const DEFAULT_GAS_BUDGET = 10_000_000 // 0.01 SUI
@@ -56,31 +57,16 @@ export function agentAddress() {
   return keypair ? keypair.getPublicKey().toSuiAddress() : null
 }
 
-function rpcError(body, method, status) {
-  const detail = body?.error?.message || body?.error || body?.message || 'unknown Tatum RPC error'
-  return new Error(`Tatum ${method}${status ? ` (HTTP ${status})` : ''}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`)
-}
-
-async function rpc(method, params, network) {
-  let response
-  try {
-    response = await tatumRpc(
-      'sui',
-      { jsonrpc: '2.0', id: 1, method, params },
-      network,
-    )
-  } catch (error) {
-    if (error instanceof MissingApiKeyError) throw error
-    throw new Error(`Tatum ${method} request failed: ${error?.message ?? String(error)}`)
-  }
-  let body
-  try {
-    body = await response.json()
-  } catch {
-    throw rpcError(null, method, response.status)
-  }
-  if (!response.ok || body?.error) throw rpcError(body, method, response.status)
-  return body.result
+// Tatum's Sui gateways are GraphQL-only (sui-*.gateway.tatum.io/graphql).
+// Everything — balances, gas price, simulate, execute — goes through that
+// endpoint, so the rail stays "via Tatum" rather than hitting fullnodes.
+function getTatumSuiClient(network) {
+  if (!process.env.TATUM_API_KEY) throw new MissingApiKeyError('TATUM_API_KEY is not set')
+  return new SuiGraphQLClient({
+    url: `${tatumGatewayUrl('sui', network)}/graphql`,
+    network,
+    headers: { 'x-api-key': process.env.TATUM_API_KEY },
+  })
 }
 
 function toBaseUnits(amount, decimals) {
@@ -97,15 +83,6 @@ function fromBaseUnits(value, decimals) {
   const whole = base / divisor
   const fraction = (base % divisor).toString().padStart(decimals, '0').replace(/0+$/, '')
   return fraction ? `${whole}.${fraction}` : `${whole}`
-}
-
-function objectRef(coin) {
-  return { objectId: coin.coinObjectId, version: coin.version, digest: coin.digest }
-}
-
-async function getCoins(owner, coinType, network) {
-  const result = await rpc('suix_getCoins', [owner, coinType, null, 50], network)
-  return result?.data ?? []
 }
 
 function pickCoin(coins, minimum) {
@@ -141,20 +118,23 @@ export async function getBalances() {
   }
 
   try {
+    const client = getTatumSuiClient(cfg.network)
     const [sui, token] = await Promise.all([
-      rpc('suix_getBalance', [address, SUI_COIN_TYPE], cfg.network),
+      client.getBalance({ owner: address, coinType: SUI_COIN_TYPE }),
       cfg.isSui
         ? Promise.resolve(null)
-        : rpc('suix_getBalance', [address, cfg.coinType], cfg.network),
+        : client.getBalance({ owner: address, coinType: cfg.coinType }).catch(() => null),
     ])
+    const suiUnits = sui?.balance?.balance ?? sui?.balance?.addressBalance ?? 0n
+    const tokenUnits = token?.balance?.balance ?? token?.balance?.addressBalance ?? 0n
     return {
       configured: true,
       address,
       symbol: cfg.symbol,
       network: cfg.network,
       balances: {
-        sui: fromBaseUnits(sui?.totalBalance, 9),
-        token: cfg.isSui ? fromBaseUnits(sui?.totalBalance, 9) : fromBaseUnits(token?.totalBalance, cfg.decimals),
+        sui: fromBaseUnits(suiUnits, 9),
+        token: cfg.isSui ? fromBaseUnits(suiUnits, 9) : fromBaseUnits(tokenUnits, cfg.decimals),
         tokenSymbol: cfg.isSui ? 'SUI' : cfg.symbol,
       },
     }
@@ -167,6 +147,50 @@ export async function getBalances() {
       error: error?.message ?? String(error),
     }
   }
+}
+
+function buildPayment(cfg, recipient, baseUnits) {
+  const tx = new Transaction()
+  tx.setGasBudget(BigInt(cfg.gasBudgetMist))
+  const [coin] = tx.splitCoins(tx.gas, [baseUnits])
+  tx.transferObjects([coin], recipient)
+  return tx
+}
+
+async function buildTokenPayment(client, cfg, recipient, baseUnits, sender) {
+  const gasPrice = BigInt((await client.getReferenceGasPrice()).referenceGasPrice)
+  const sui = new Transaction()
+  // gas selected by SDK from sender's SUI automatically
+  const tx = new Transaction()
+  tx.setSender(sender)
+  tx.setGasPrice(gasPrice)
+  tx.setGasBudget(BigInt(cfg.gasBudgetMist))
+
+  const result = await client.listCoins({ owner: sender, coinType: cfg.coinType })
+  const tokenCoins = result?.coins ?? result?.objects ?? []
+  const selected = []
+  let sum = 0n
+  for (const coin of tokenCoins.slice().sort((a, b) => Number(BigInt(b.balance) - BigInt(a.balance)))) {
+    selected.push(coin)
+    sum += BigInt(coin.balance)
+    if (sum >= baseUnits) break
+  }
+  if (sum < baseUnits) {
+    throw new PaymentNotConfiguredError(
+      `Agent wallet ${sender} needs ${fromBaseUnits(baseUnits, cfg.decimals)} ${cfg.symbol} to pay.`,
+    )
+  }
+  const primaryId = selected[0].coinObjectId ?? selected[0].objectId ?? selected[0].address
+  const primary = tx.object(primaryId)
+  if (selected.length > 1) {
+    tx.mergeCoins(
+      primary,
+      selected.slice(1).map(coin => tx.object(coin.coinObjectId ?? coin.objectId ?? coin.address)),
+    )
+  }
+  const [coin] = tx.splitCoins(primary, [baseUnits])
+  tx.transferObjects([coin], recipient)
+  return tx
 }
 
 export async function buildPaymentTransaction(options = {}) {
@@ -185,68 +209,22 @@ export async function buildPaymentTransaction(options = {}) {
   const recipient = options.recipient || cfg.recipient || sender
   const amount = Number(options.amount ?? cfg.amount)
   const baseUnits = toBaseUnits(amount, cfg.decimals)
-  const gasBudget = BigInt(cfg.gasBudgetMist)
 
-  const [gasPriceRaw, suiCoins] = await Promise.all([
-    rpc('suix_getReferenceGasPrice', [], cfg.network),
-    getCoins(sender, SUI_COIN_TYPE, cfg.network),
-  ])
-  const gasPrice = BigInt(gasPriceRaw)
-
-  const tx = new Transaction()
+  const client = getTatumSuiClient(cfg.network)
+  const tx = cfg.isSui
+    ? buildPayment(cfg, recipient, baseUnits)
+    : await buildTokenPayment(client, cfg, recipient, baseUnits, sender)
   tx.setSender(sender)
-  tx.setGasBudget(gasBudget)
+
+  const gasPrice = BigInt((await client.getReferenceGasPrice()).referenceGasPrice)
   tx.setGasPrice(gasPrice)
 
-  if (cfg.isSui) {
-    const gasCoin = pickCoin(suiCoins, baseUnits + gasBudget)
-    if (!gasCoin) {
-      throw new PaymentNotConfiguredError(
-        `Agent wallet ${sender} needs at least ${fromBaseUnits(baseUnits + gasBudget, 9)} SUI (payment + gas).`,
-      )
-    }
-    tx.setGasPayment([objectRef(gasCoin)])
-    const [coin] = tx.splitCoins(tx.gas, [baseUnits])
-    tx.transferObjects([coin], recipient)
-  } else {
-    const gasCoin = pickCoin(suiCoins, gasBudget)
-    if (!gasCoin) {
-      throw new PaymentNotConfiguredError(
-        `Agent wallet ${sender} needs at least ${fromBaseUnits(gasBudget, 9)} SUI for gas.`,
-      )
-    }
-    tx.setGasPayment([objectRef(gasCoin)])
-
-    const tokenCoins = await getCoins(sender, cfg.coinType, cfg.network)
-    const selected = []
-    let sum = 0n
-    for (const coin of tokenCoins.slice().sort((a, b) => Number(BigInt(b.balance) - BigInt(a.balance)))) {
-      selected.push(coin)
-      sum += BigInt(coin.balance)
-      if (sum >= baseUnits) break
-    }
-    if (sum < baseUnits) {
-      throw new PaymentNotConfiguredError(
-        `Agent wallet ${sender} needs ${fromBaseUnits(baseUnits, cfg.decimals)} ${cfg.symbol} to pay.`,
-      )
-    }
-
-    const primary = tx.object(objectRef(selected[0]))
-    if (selected.length > 1) {
-      tx.mergeCoins(
-        primary,
-        selected.slice(1).map(coin => tx.object(objectRef(coin))),
-      )
-    }
-    const [coin] = tx.splitCoins(primary, [baseUnits])
-    tx.transferObjects([coin], recipient)
-  }
-
-  const bytes = await tx.build()
+  const bytes = await tx.build({ client })
   const { signature } = await keypair.signTransaction(bytes)
 
   return {
-    bytes: Buffer.from(bytes).toString('base64'),
+    tx,
+    bytes,
     signature,
     sender,
     recipient,
@@ -261,51 +239,62 @@ export async function buildPaymentTransaction(options = {}) {
 
 export async function dryRunPayment(options = {}) {
   const built = await buildPaymentTransaction(options)
-  const result = await rpc('sui_dryRunTransactionBlock', [built.bytes], built.network)
-  const status = result?.effects?.status?.status ?? 'unknown'
+  const client = getTatumSuiClient(built.network)
+  const sim = await client.simulateTransaction({
+    transaction: built.tx,
+    include: { effects: true, balanceChanges: true },
+  })
+  const txr = sim.Transaction ?? sim.FailedTransaction ?? null
+  const success = sim.$kind === 'Transaction' && txr?.status?.success === true
   return {
-    ...built,
-    bytes: undefined,
-    signature: undefined,
+    sender: built.sender,
+    recipient: built.recipient,
+    amount: built.amount,
+    baseUnits: built.baseUnits,
+    symbol: built.symbol,
+    coinType: built.coinType,
+    network: built.network,
+    gasBudgetMist: built.gasBudgetMist,
     dryRun: {
-      status,
-      success: status === 'success',
-      error: result?.effects?.status?.error ?? null,
-      gasUsed: result?.effects?.gasUsed ?? null,
-      effects: result?.effects ?? null,
-      objectChanges: result?.objectChanges ?? null,
-      balanceChanges: result?.balanceChanges ?? null,
+      status: success ? 'success' : 'failed',
+      success,
+      error: txr?.status?.error ?? null,
+      digest: txr?.digest ?? null,
+      gasUsed: txr?.gasEffects ?? null,
+      balanceChanges: txr?.balanceChanges ?? null,
+      commandResults: null,
     },
   }
 }
 
 export async function executePayment(options = {}) {
   const built = await buildPaymentTransaction(options)
-  const result = await rpc(
-    'sui_executeTransactionBlock',
-    [
-      built.bytes,
-      [built.signature],
-      { showEffects: true, showEvents: true, showObjectChanges: true, showBalanceChanges: true },
-      'WaitForLocalExecution',
-    ],
-    built.network,
-  )
-  const status = result?.effects?.status?.status ?? 'unknown'
-  const digest = result?.digest ?? null
+  const client = getTatumSuiClient(built.network)
+  const result = await client.signAndExecuteTransaction({
+    transaction: built.tx,
+    signer: getAgentKeypair(),
+    include: { effects: true, balanceChanges: true },
+  })
+  const txr = result.Transaction ?? result.FailedTransaction ?? null
+  const success = result.$kind === 'Transaction' && txr?.status?.success === true
+  const digest = txr?.digest ?? null
   return {
-    ...built,
-    bytes: undefined,
-    signature: undefined,
+    sender: built.sender,
+    recipient: built.recipient,
+    amount: built.amount,
+    baseUnits: built.baseUnits,
+    symbol: built.symbol,
+    coinType: built.coinType,
+    network: built.network,
     digest,
     explorerUrl: digest ? `${paymentConfig().explorerBase}/tx/${digest}` : null,
     execution: {
-      status,
-      success: status === 'success',
-      error: result?.effects?.status?.error ?? null,
-      effects: result?.effects ?? null,
-      events: result?.events ?? null,
-      balanceChanges: result?.balanceChanges ?? null,
+      status: success ? 'success' : 'failed',
+      success,
+      error: txr?.status?.error ?? null,
+      digest,
+      effects: txr?.effects ?? null,
+      balanceChanges: txr?.balanceChanges ?? null,
     },
   }
 }
