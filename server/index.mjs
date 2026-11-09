@@ -13,6 +13,8 @@ import react from '@vitejs/plugin-react'
 import { fileURLToPath } from 'url'
 import path from 'path'
 import tatumRoutes from './routes/tatum.mjs'
+import creditRoutes from './routes/credit.mjs'
+import paymentRoutes from './routes/payment.mjs'
 import { credentialGuard } from './credential-guard.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -31,6 +33,22 @@ app.use(express.json())
 app.use(credentialGuard)
 
 app.use('/api/tatum', tatumRoutes)
+app.use('/api/credit', creditRoutes)
+app.use('/api/payment', paymentRoutes)
+
+// API errors stay JSON — Vite's dev middleware would otherwise turn a rejected
+// route into an HTML error page the dashboard cannot parse.
+app.use('/api', (error, _req, res, _next) => {
+  if (res.headersSent) return
+  const status =
+    error?.status ??
+    (error?.name === 'MissingApiKeyError' || error?.name === 'PaymentNotConfiguredError' ? 503 : 500)
+  console.error(`[api] ${error?.name ?? 'Error'}: ${error?.message ?? error}`)
+  res.status(status).json({
+    error: error?.message ?? 'Unexpected server error',
+    code: error?.name ?? 'Error',
+  })
+})
 
 const server = createHttpServer(app)
 

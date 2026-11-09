@@ -1,772 +1,1644 @@
-import React, { useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  Brain,
-  ArrowRightLeft,
-  FileCheck2,
-  History,
-  CheckCircle2,
   AlertTriangle,
-  XCircle,
+  ArrowRight,
+  ArrowRightLeft,
+  Brain,
+  Check,
+  CheckCircle2,
+  ChevronRight,
   Coins,
+  Copy,
+  Database,
+  FileCheck2,
+  Fingerprint,
+  History,
+  Loader2,
+  Lock,
+  RefreshCw,
   ShieldCheck,
+  Sparkles,
   TrendingDown,
-  RotateCcw
+  TrendingUp,
+  Wallet,
+  XCircle,
 } from 'lucide-react'
+import {
+  api,
+  type AppStatus,
+  type BreakdownItem,
+  type CreditState,
+  type Decision,
+  type Direction,
+  type HistoryResponse,
+  type Interaction,
+  type InteractionType,
+  type PaymentAuthorization,
+  type PaymentExecution,
+  type Verdict,
+} from './lib/api'
 
-type TabType = 'dashboard' | 'request' | 'decision' | 'history'
+type Tab = 'dashboard' | 'request' | 'decision' | 'history'
 
-interface HistoryEntry {
-  id: string
-  timestamp: string
-  type: 'request' | 'repayment' | 'default'
-  direction: 'alice_to_bob' | 'bob_to_alice'
-  amount: number
-  purpose?: string
-  status: 'ALLOW' | 'REDUCE' | 'BLOCK' | 'RECORDED'
-  evidence: string[]
-  memoryActive: boolean
+// Credit amounts are denominated in the same unit the agent rail moves.
+const CREDIT_UNIT = 'SUI'
+
+const DIRECTION_LABEL: Record<Direction, string> = {
+  alice_to_bob: 'Alice → Bob',
+  bob_to_alice: 'Bob → Alice',
+}
+
+const TYPE_TONE: Record<InteractionType, string> = {
+  repayment: 'success',
+  default: 'error',
+  advance: 'brand',
+  fulfillment: 'gray',
+  request: 'warning',
+}
+
+function fmt(value: number, digits = 1) {
+  return Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })
+}
+
+function fmtAmount(value: number) {
+  return Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
+}
+
+function shortBlob(blobId?: string | null) {
+  if (!blobId) return 'no blob id'
+  if (blobId.length <= 22) return blobId
+  return `${blobId.slice(0, 12)}…${blobId.slice(-6)}`
+}
+
+function shortAddress(address?: string | null) {
+  if (!address) return 'not configured'
+  if (address.length <= 18) return address
+  return `${address.slice(0, 8)}…${address.slice(-6)}`
+}
+
+function timeAgo(timestamp: string) {
+  const then = new Date(timestamp).getTime()
+  if (Number.isNaN(then)) return 'unknown'
+  const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000))
+  if (seconds < 60) return `${seconds}s ago`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
+  if (seconds < 86400 * 30) return `${Math.floor(seconds / 86400)}d ago`
+  return new Date(timestamp).toLocaleDateString()
+}
+
+function fmtDate(timestamp: string) {
+  return new Date(timestamp).toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function Badge({
+  children,
+  tone = 'gray',
+  dot = false,
+}: {
+  children: React.ReactNode
+  tone?: 'gray' | 'brand' | 'success' | 'warning' | 'error'
+  dot?: boolean
+}) {
+  const tones: Record<string, string> = {
+    gray: 'border-utility-gray-200 bg-utility-gray-50 text-utility-gray-700',
+    brand: 'border-utility-brand-200 bg-utility-brand-50 text-utility-brand-700',
+    success: 'border-utility-success-200 bg-utility-success-50 text-utility-success-700',
+    warning: 'border-utility-warning-200 bg-utility-warning-50 text-utility-warning-700',
+    error: 'border-utility-error-200 bg-utility-error-50 text-utility-error-700',
+  }
+  const dots: Record<string, string> = {
+    gray: 'bg-utility-gray-600',
+    brand: 'bg-utility-brand-600',
+    success: 'bg-utility-success-600',
+    warning: 'bg-utility-warning-600',
+    error: 'bg-utility-error-600',
+  }
+  return (
+    <span
+      className={`inline-flex items-center gap-xs rounded-full border px-md py-xxs text-xs font-medium whitespace-nowrap ${tones[tone]}`}
+    >
+      {dot && <span className={`size-1.5 rounded-full ${dots[tone]}`} aria-hidden="true" />}
+      {children}
+    </span>
+  )
+}
+
+function VerdictBadge({ verdict }: { verdict: Verdict }) {
+  if (verdict === 'ALLOW') {
+    return (
+      <Badge tone="success">
+        <CheckCircle2 className="size-3.5" /> ALLOW
+      </Badge>
+    )
+  }
+  if (verdict === 'REDUCE') {
+    return (
+      <Badge tone="warning">
+        <AlertTriangle className="size-3.5" /> REDUCE
+      </Badge>
+    )
+  }
+  return (
+    <Badge tone="error">
+      <XCircle className="size-3.5" /> BLOCK
+    </Badge>
+  )
+}
+
+function typeIcon(type: InteractionType) {
+  if (type === 'repayment') return <TrendingUp className="size-4" />
+  if (type === 'default') return <TrendingDown className="size-4" />
+  if (type === 'advance') return <Coins className="size-4" />
+  if (type === 'fulfillment') return <Sparkles className="size-4" />
+  return <FileCheck2 className="size-4" />
+}
+
+function ContributionBar({ direction }: { direction: CreditState['directions']['alice_to_bob'] }) {
+  const positive = direction.breakdown.filter(item => item.delta > 0).reduce((sum, item) => sum + item.delta, 0)
+  const negative = direction.breakdown.filter(item => item.delta < 0).reduce((sum, item) => sum + Math.abs(item.delta), 0)
+  const base = 10
+  const recency = direction.recentBonus
+  const total = Math.max(base + positive + recency + negative, 0.001)
+  const seg = (value: number) => `${Math.max(0, (value / total) * 100)}%`
+
+  return (
+    <div className="mt-lg">
+      <div className="flex h-2 w-full overflow-hidden rounded-full bg-tertiary">
+        <span className="bg-utility-gray-600" style={{ width: seg(base) }} title={`Base ${base}`} />
+        <span className="bg-utility-success-600" style={{ width: seg(positive) }} title={`Repayments +${positive}`} />
+        <span className="bg-utility-brand-600" style={{ width: seg(recency) }} title={`Recency +${recency}`} />
+        <span className="bg-utility-error-600" style={{ width: seg(negative) }} title={`Drawdowns −${negative}`} />
+      </div>
+      <div className="mt-sm flex flex-wrap items-center gap-x-md gap-y-xs text-[11px] text-tertiary">
+        <span>Base 10</span>
+        <span className="text-utility-success-700">+ repayments {fmt(positive)}</span>
+        <span className="text-utility-brand-700">+ recency {fmt(recency)}</span>
+        <span className="text-utility-error-700">− drawdowns {fmt(negative)}</span>
+      </div>
+    </div>
+  )
+}
+
+function LimitCard({
+  directionKey,
+  direction,
+  memoryCount,
+  source,
+  updatedAt,
+}: {
+  directionKey: Direction
+  direction: CreditState['directions']['alice_to_bob']
+  memoryCount: number
+  source: 'walrus' | 'mock'
+  updatedAt: string
+}) {
+  const [lender, borrower] = directionKey === 'alice_to_bob' ? ['Alice', 'Bob'] : ['Bob', 'Alice']
+
+  return (
+    <article className="rounded-2xl border border-secondary bg-primary p-2xl shadow-xs flex flex-col">
+      <div className="flex items-start justify-between gap-md">
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">Bilateral credit line</p>
+          <h2 className="mt-xxs text-heading-xs font-semibold text-primary">
+            {lender} <span className="text-fg-quaternary">→</span> {borrower}
+          </h2>
+        </div>
+        <Badge tone={source === 'walrus' ? 'success' : 'warning'} dot>
+          {source === 'walrus' ? 'Walrus' : 'Demo'}
+        </Badge>
+      </div>
+
+      <div className="mt-xl flex items-end gap-sm">
+        <span className="text-heading-2xl font-semibold leading-none tracking-tight text-primary tabular-nums">
+          {fmt(direction.limit)}
+        </span>
+        <span className="mb-sm text-sm font-medium text-tertiary">{CREDIT_UNIT}</span>
+      </div>
+      <p className="mt-sm text-xs text-tertiary">
+        Rebuilt from {memoryCount} memories · {timeAgo(updatedAt)}
+      </p>
+
+      <ContributionBar direction={direction} />
+
+      <div className="mt-xl grid grid-cols-3 gap-sm border-t border-secondary pt-lg">
+        <div>
+          <p className="text-[11px] uppercase tracking-wide text-quaternary">Repayments</p>
+          <p className="mt-xxs text-sm font-semibold text-utility-success-700 tabular-nums">
+            {direction.breakdown.filter(i => i.delta > 0).length}
+          </p>
+        </div>
+        <div>
+          <p className="text-[11px] uppercase tracking-wide text-quaternary">7-day hits</p>
+          <p className="mt-xxs text-sm font-semibold text-primary tabular-nums">{direction.recentSuccesses}</p>
+        </div>
+        <div>
+          <p className="text-[11px] uppercase tracking-wide text-quaternary">Drawdowns</p>
+          <p className="mt-xxs text-sm font-semibold text-utility-error-700 tabular-nums">
+            {fmt(direction.breakdown.filter(i => i.delta < 0).reduce((sum, i) => sum + Math.abs(i.delta), 0))}
+          </p>
+        </div>
+      </div>
+    </article>
+  )
+}
+
+function MemoryRow({
+  interaction,
+  delta,
+  compact = false,
+}: {
+  interaction: Interaction
+  delta?: number
+  compact?: boolean
+}) {
+  const tone = TYPE_TONE[interaction.type] as 'gray' | 'brand' | 'success' | 'warning' | 'error'
+  return (
+    <li className="flex items-start gap-md rounded-xl border border-secondary bg-primary px-lg py-md">
+      <span
+        className={`mt-xxs flex size-8 shrink-0 items-center justify-center rounded-full border ${
+          tone === 'success'
+            ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+            : tone === 'error'
+              ? 'border-utility-error-200 bg-utility-error-50 text-utility-error-700'
+              : tone === 'brand'
+                ? 'border-utility-brand-200 bg-utility-brand-50 text-utility-brand-700'
+                : 'border-utility-gray-200 bg-utility-gray-50 text-utility-gray-700'
+        }`}
+      >
+        {typeIcon(interaction.type)}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-x-sm gap-y-xs">
+          <Badge tone={tone}>{interaction.type}</Badge>
+          <span className="text-xs font-medium text-secondary">
+            {interaction.from} → {interaction.to}
+          </span>
+          <span className="text-xs font-semibold text-primary tabular-nums">{fmtAmount(interaction.amount)}</span>
+          {interaction.result !== 'success' && <Badge tone="error">{interaction.result}</Badge>}
+          {typeof delta === 'number' && delta !== 0 && (
+            <span
+              className={`rounded-full px-sm py-xxs text-[11px] font-semibold tabular-nums ${
+                delta > 0 ? 'bg-utility-success-50 text-utility-success-700' : 'bg-utility-error-50 text-utility-error-700'
+              }`}
+            >
+              {delta > 0 ? '+' : ''}
+              {fmt(delta)}
+            </span>
+          )}
+          <span className="ml-auto font-mono text-[10px] text-quaternary" title={interaction.blobId ?? undefined}>
+            {shortBlob(interaction.blobId)}
+          </span>
+        </div>
+        <p className="mt-xxs truncate text-xs text-tertiary">
+          {interaction.note || interaction.text}
+          <span className="ml-sm text-quaternary">· {timeAgo(interaction.timestamp)}</span>
+        </p>
+        {!compact && (
+          <p className="mt-xxs truncate font-mono text-[10px] text-quaternary" title={interaction.text}>
+            {interaction.text}
+          </p>
+        )}
+      </div>
+    </li>
+  )
+}
+
+function FormulaPanel() {
+  return (
+    <div className="rounded-2xl border border-secondary bg-primary p-xl">
+      <div className="flex items-center gap-sm">
+        <ShieldCheck className="size-4 text-fg-brand-primary" />
+        <h3 className="text-sm font-semibold text-primary">The whole policy</h3>
+      </div>
+      <div className="mt-md space-y-xs font-mono text-[11px] leading-5 text-secondary">
+        <p>limit = 10</p>
+        <p className="text-utility-success-700">+ min(amount × 0.5, 8) · successful repayment</p>
+        <p className="text-utility-error-700">− 15 · default or failed repayment</p>
+        <p className="text-utility-error-700">− amount × 0.2 · open advance</p>
+        <p className="text-utility-brand-700">+ 2 · borrower success in last 7 days</p>
+        <p>floor at 0 · one decimal</p>
+      </div>
+      <p className="mt-md text-xs text-tertiary">
+        No database, no cache, no stored limit. The same blobs always produce the same number.
+      </p>
+    </div>
+  )
+}
+
+function SectionHeading({ eyebrow, title, action }: { eyebrow: string; title: string; action?: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-sm sm:flex-row sm:items-end sm:justify-between">
+      <div>
+        <p className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">{eyebrow}</p>
+        <h2 className="mt-xxs text-heading-xs font-semibold text-primary">{title}</h2>
+      </div>
+      {action}
+    </div>
+  )
+}
+
+function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1400)
+    } catch {
+      setCopied(false)
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      className="inline-flex items-center gap-xs rounded-md border border-secondary bg-primary px-sm py-xxs text-[11px] font-medium text-secondary hover:bg-primary-hover"
+    >
+      {copied ? <Check className="size-3 text-fg-success-primary" /> : <Copy className="size-3" />}
+      {copied ? 'Copied' : label}
+    </button>
+  )
+}
+
+function Spinner({ label }: { label: string }) {
+  return (
+    <span className="inline-flex items-center gap-sm">
+      <Loader2 className="size-4 animate-spin" />
+      {label}
+    </span>
+  )
 }
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<TabType>('dashboard')
-  const [memoryEnabled, setMemoryEnabled] = useState<boolean>(true)
+  const [tab, setTab] = useState<Tab>('dashboard')
+  const [memoryEnabled, setMemoryEnabled] = useState(true)
+  const [state, setState] = useState<CreditState | null>(null)
+  const [status, setStatus] = useState<AppStatus | null>(null)
+  const [history, setHistory] = useState<HistoryResponse | null>(null)
+  const [historyFilter, setHistoryFilter] = useState<string>('all')
+  const [decision, setDecision] = useState<Decision | null>(null)
+  const [paymentAuth, setPaymentAuth] = useState<PaymentAuthorization | null>(null)
+  const [paymentExec, setPaymentExec] = useState<PaymentExecution | null>(null)
+  const [outcomeNote, setOutcomeNote] = useState('')
+  const [reqDirection, setReqDirection] = useState<Direction>('alice_to_bob')
+  const [reqAmount, setReqAmount] = useState('25')
+  const [reqPurpose, setReqPurpose] = useState('Short-term settlement buffer')
+  const [busy, setBusy] = useState<string | null>('state')
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [verifyResult, setVerifyResult] = useState<'match' | 'changed' | null>(null)
 
-  // Credit limits (client-side state)
-  const [aliceToBobLimit, setAliceToBobLimit] = useState<number>(5000)
-  const [bobToAliceLimit, setBobToAliceLimit] = useState<number>(3500)
+  const clearAlerts = () => {
+    setError(null)
+    setNotice(null)
+  }
 
-  // Request form state
-  const [reqDirection, setReqDirection] = useState<'alice_to_bob' | 'bob_to_alice'>('alice_to_bob')
-  const [reqAmount, setReqAmount] = useState<string>('1200')
-  const [reqPurpose, setReqPurpose] = useState<string>('Liquidity supply for trade settlement')
-
-  // History state
-  const [history, setHistory] = useState<HistoryEntry[]>([
-    {
-      id: 'tx-1',
-      timestamp: 'Today, 10:15 AM',
-      type: 'request',
-      direction: 'alice_to_bob',
-      amount: 1200,
-      purpose: 'Trade liquidity buffer',
-      status: 'ALLOW',
-      evidence: [
-        'Requested amount ($1,200) within available credit limit ($5,000)',
-        'Historical repayment rate is 100% across previous settlement cycles',
-        'Memory state active: Alice has zero recorded defaults against Bob'
-      ],
-      memoryActive: true
-    },
-    {
-      id: 'tx-2',
-      timestamp: 'Yesterday, 3:45 PM',
-      type: 'repayment',
-      direction: 'bob_to_alice',
-      amount: 500,
-      purpose: 'Repayment of invoice settlement #402',
-      status: 'RECORDED',
-      evidence: [
-        'Repayment confirmed on ledger log',
-        'Positive reputation score incremented for Bob'
-      ],
-      memoryActive: true
+  const loadState = useCallback(async (memory: boolean) => {
+    setBusy('state')
+    try {
+      const next = await api.state(memory)
+      setState(next)
+      return next
+    } finally {
+      setBusy(null)
     }
-  ])
+  }, [])
 
-  // Latest decision state
-  const [latestDecision, setLatestDecision] = useState<{
-    direction: 'alice_to_bob' | 'bob_to_alice'
-    amount: number
-    purpose: string
-    verdict: 'ALLOW' | 'REDUCE' | 'BLOCK'
-    calculatedLimit: number
-    evidence: string[]
-    memoryActive: boolean
-  }>({
-    direction: 'alice_to_bob',
-    amount: 1200,
-    purpose: 'Liquidity supply for trade settlement',
-    verdict: 'ALLOW',
-    calculatedLimit: 5000,
-    evidence: [
-      'Credit line status: Active bilateral trust agreement',
-      'Memory enabled: Historical party behavior and defaults evaluated',
-      'Utilization score: Within approved safety threshold (24% of maximum pool)'
-    ],
-    memoryActive: true
-  })
+  const loadHistory = useCallback(async (filter: string) => {
+    const next = await api.history(filter)
+    setHistory(next)
+    return next
+  }, [])
 
-  // Submit request logic
-  const handleEvaluateRequest = (e: React.FormEvent) => {
-    e.preventDefault()
-    const amountNum = parseFloat(reqAmount) || 0
-    const availableLimit = reqDirection === 'alice_to_bob' ? aliceToBobLimit : bobToAliceLimit
-
-    let verdict: 'ALLOW' | 'REDUCE' | 'BLOCK' = 'ALLOW'
-    let calculatedLimit = availableLimit
-    const evidence: string[] = []
-
-    if (memoryEnabled) {
-      evidence.push('Adaptive Memory Engine: ENABLED (prior transaction patterns factored into risk rating)')
-    } else {
-      evidence.push('Adaptive Memory Engine: DISABLED (stateless evaluation based purely on static cap)')
+  const loadStatus = useCallback(async () => {
+    try {
+      const next = await api.status()
+      setStatus(next)
+    } catch {
+      // Status is supplementary; the dashboard still works without it.
     }
+  }, [])
 
-    if (amountNum <= 0) {
-      verdict = 'BLOCK'
-      evidence.push('Invalid credit request amount provided')
-    } else if (amountNum <= availableLimit) {
-      verdict = 'ALLOW'
-      evidence.push(`Requested sum ($${amountNum.toLocaleString()}) is fully covered by current ceiling ($${availableLimit.toLocaleString()})`)
-      if (memoryEnabled) {
-        evidence.push('Zero delinquent events registered between parties in memory ledger')
-        evidence.push('Counterparty exposure ratio is healthy (<60%)')
+  useEffect(() => {
+    let alive = true
+    Promise.all([api.state(true), api.history('all'), api.status()])
+      .then(([nextState, nextHistory, nextStatus]) => {
+        if (!alive) return
+        setState(nextState)
+        setHistory(nextHistory)
+        setStatus(nextStatus)
+      })
+      .catch(err => {
+        if (alive) setError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => {
+        if (alive) setBusy(null)
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const refreshAll = async (filter = historyFilter) => {
+    await Promise.all([loadState(memoryEnabled), loadHistory(filter), loadStatus()])
+  }
+
+  const handleToggleMemory = async () => {
+    const next = !memoryEnabled
+    setMemoryEnabled(next)
+    setVerifyResult(null)
+    clearAlerts()
+    try {
+      await loadState(next)
+      if (decision) {
+        const recalculated = await api.evaluate({
+          direction: decision.direction,
+          amount: decision.amount,
+          purpose: decision.purpose,
+          memory: next,
+        })
+        setDecision(recalculated)
+        setPaymentAuth(null)
+        setPaymentExec(null)
       }
-    } else if (amountNum <= availableLimit * 1.5 && memoryEnabled) {
-      verdict = 'REDUCE'
-      calculatedLimit = availableLimit
-      evidence.push(`Requested sum ($${amountNum.toLocaleString()}) exceeds base limit ($${availableLimit.toLocaleString()})`)
-      evidence.push(`Memory risk protocol permits conditional reduction to safety ceiling: $${calculatedLimit.toLocaleString()}`)
-    } else {
-      verdict = 'BLOCK'
-      calculatedLimit = availableLimit
-      evidence.push(`Requested sum ($${amountNum.toLocaleString()}) critically exceeds limit ($${availableLimit.toLocaleString()})`)
-      evidence.push('Exceeds allowable unilateral exposure margin')
+      setNotice(
+        next
+          ? 'Memory is back on. Limits are rebuilt from every recalled interaction.'
+          : 'Memory is off. The policy returns the base limit of 10 with no history.',
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
     }
-
-    const newDecision = {
-      direction: reqDirection,
-      amount: amountNum,
-      purpose: reqPurpose || 'Unspecified credit transfer',
-      verdict,
-      calculatedLimit,
-      evidence,
-      memoryActive: memoryEnabled
-    }
-
-    setLatestDecision(newDecision)
-
-    const newEntry: HistoryEntry = {
-      id: `tx-${Date.now()}`,
-      timestamp: 'Just now',
-      type: 'request',
-      direction: reqDirection,
-      amount: amountNum,
-      purpose: reqPurpose || 'Unspecified credit transfer',
-      status: verdict,
-      evidence,
-      memoryActive: memoryEnabled
-    }
-
-    setHistory(prev => [newEntry, ...prev])
-    setActiveTab('decision')
   }
 
-  const handleRecordRepayment = (direction: 'alice_to_bob' | 'bob_to_alice') => {
-    const repayAmount = 500
-    if (direction === 'alice_to_bob') {
-      setAliceToBobLimit(prev => prev + repayAmount)
-    } else {
-      setBobToAliceLimit(prev => prev + repayAmount)
+  const handleEvaluate = async (event: React.FormEvent) => {
+    event.preventDefault()
+    clearAlerts()
+    const amount = Number(reqAmount)
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setError('Enter a positive request amount.')
+      return
     }
-
-    const entry: HistoryEntry = {
-      id: `tx-${Date.now()}`,
-      timestamp: 'Just now',
-      type: 'repayment',
-      direction,
-      amount: repayAmount,
-      purpose: 'Simulated credit line repayment',
-      status: 'RECORDED',
-      evidence: [
-        `Repayment of $${repayAmount} received and logged`,
-        `Available credit ceiling expanded by +$${repayAmount}`
-      ],
-      memoryActive: memoryEnabled
+    setBusy('evaluate')
+    try {
+      const next = await api.evaluate({
+        direction: reqDirection,
+        amount,
+        purpose: reqPurpose,
+        memory: memoryEnabled,
+      })
+      setDecision(next)
+      setPaymentAuth(null)
+      setPaymentExec(null)
+      setTab('decision')
+      await loadHistory(historyFilter)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
     }
-    setHistory(prev => [entry, ...prev])
   }
 
-  const handleRecordDefault = (direction: 'alice_to_bob' | 'bob_to_alice') => {
-    const penalty = 1000
-    if (direction === 'alice_to_bob') {
-      setAliceToBobLimit(prev => Math.max(0, prev - penalty))
-    } else {
-      setBobToAliceLimit(prev => Math.max(0, prev - penalty))
+  const handleRecord = async (kind: 'repayment' | 'default' | 'advance') => {
+    if (!decision) return
+    clearAlerts()
+    setBusy(`record-${kind}`)
+    const from = kind === 'advance' ? decision.lender : decision.borrower
+    const to = kind === 'advance' ? decision.borrower : decision.lender
+    const result = kind === 'default' ? 'failed' : 'success'
+    try {
+      const written = await api.record({
+        type: kind,
+        from,
+        to,
+        amount: decision.amount,
+        result,
+        note: outcomeNote || `recorded after ${decision.label} decision`,
+      })
+      const next = await api.evaluate({
+        direction: decision.direction,
+        amount: decision.amount,
+        purpose: decision.purpose,
+        memory: true,
+      })
+      setDecision(next)
+      setPaymentAuth(null)
+      setPaymentExec(null)
+      setOutcomeNote('')
+      await Promise.all([loadState(true), loadHistory(historyFilter)])
+      setNotice(
+        `Wrote ${kind} memory ${shortBlob(written.memory.blobId)}. Limit is now ${fmt(
+          next.limit,
+        )} for ${next.label}.`,
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
     }
-
-    const entry: HistoryEntry = {
-      id: `tx-${Date.now()}`,
-      timestamp: 'Just now',
-      type: 'default',
-      direction,
-      amount: penalty,
-      purpose: 'Simulated counterparty default flag',
-      status: 'BLOCK',
-      evidence: [
-        'Default recorded in counterparty ledger profile',
-        `Credit capacity slashed by -$${penalty} to mitigate bad debt risk`,
-        memoryEnabled ? 'Memory module tagged counterparty with elevated default probability' : 'Stateless mode: limit decremented without reputation penalty'
-      ],
-      memoryActive: memoryEnabled
-    }
-    setHistory(prev => [entry, ...prev])
   }
+
+  const handleSeed = async () => {
+    clearAlerts()
+    setBusy('seed')
+    try {
+      const seeded = await api.seed(false)
+      setNotice(
+        seeded.alreadySeeded
+          ? 'The namespace already holds the 15-memory seed set.'
+          : `Seeded ${seeded.seeded.length} memories${seeded.errors.length ? `, ${seeded.errors.length} failed` : ''}.`,
+      )
+      await refreshAll()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const handleVerify = async () => {
+    if (!state) return
+    clearAlerts()
+    setBusy('verify')
+    try {
+      const result = await api.verify(state.fingerprint.short)
+      setVerifyResult(result.matches ? 'match' : 'changed')
+      setNotice(
+        result.matches
+          ? `Same fingerprint after a full re-recall: ${result.current.short}. The limit is reproducible.`
+          : `Fingerprint changed to ${result.current.short}. New memories were written since the last view.`,
+      )
+      await loadState(memoryEnabled)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const handleFilter = async (filter: string) => {
+    setHistoryFilter(filter)
+    clearAlerts()
+    setBusy('history')
+    try {
+      await loadHistory(filter)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const handleAuthorizePayment = async () => {
+    if (!decision) return
+    clearAlerts()
+    setBusy('authorize')
+    setPaymentExec(null)
+    try {
+      const result = await api.authorizePayment({
+        direction: decision.direction,
+        requestedAmount: decision.amount,
+        purpose: decision.purpose,
+      })
+      setPaymentAuth(result)
+      if (result.payment?.dryRun?.success) {
+        setNotice(`Tatum Sui dry-run succeeded for ${result.paymentAmount} ${result.symbol}.`)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const handleExecutePayment = async () => {
+    if (!decision) return
+    clearAlerts()
+    setBusy('execute')
+    try {
+      const result = await api.executePayment({
+        direction: decision.direction,
+        requestedAmount: decision.amount,
+        purpose: decision.purpose,
+      })
+      setPaymentExec(result)
+      if (result.execution?.success) {
+        setNotice(`Agent payment executed: ${result.digest?.slice(0, 12)}…`)
+        await Promise.all([loadState(true), loadHistory(historyFilter)])
+        const next = await api.evaluate({
+          direction: decision.direction,
+          amount: decision.amount,
+          purpose: decision.purpose,
+          memory: true,
+        })
+        setDecision(next)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const latestEvidence = useMemo(() => (state?.evidence ?? []).slice(-6).reverse(), [state])
+  const activeDirection = decision?.direction ?? reqDirection
+  const activeLimit = state?.limits[activeDirection] ?? 10
+  const isWalrus = state?.source === 'walrus'
+  const memoryCount = state?.memoryCount ?? 0
+
+  const tabs: Array<{ id: Tab; label: string; icon: React.ReactNode; count?: number }> = [
+    { id: 'dashboard', label: 'Overview', icon: <Coins className="size-4" /> },
+    { id: 'request', label: 'Request credit', icon: <ArrowRightLeft className="size-4" /> },
+    { id: 'decision', label: 'Decision', icon: <FileCheck2 className="size-4" /> },
+    { id: 'history', label: 'Memory ledger', icon: <History className="size-4" />, count: history?.namespaceTotal },
+  ]
 
   return (
-    <div className="min-h-screen bg-secondary text-primary font-sans antialiased flex flex-col">
-      {/* Top Header */}
-      <header className="border-b border-secondary bg-primary px-xl py-lg sticky top-0 z-10 shadow-xs">
-        <div className="max-w-6xl mx-auto flex flex-col sm:flex-row sm:items-center sm:justify-between gap-md">
-          <div className="flex items-center gap-md">
-            {/* Featured Icon component recipe */}
-            <span className="flex size-10 items-center justify-center rounded-full bg-utility-brand-50 shrink-0">
-              <ArrowRightLeft className="size-5 shrink-0 text-utility-brand-600" />
+    <div className="min-h-screen bg-secondary text-primary font-sans antialiased">
+      <header className="sticky top-0 z-20 border-b border-secondary bg-primary/95 backdrop-blur">
+        <div className="mx-auto flex max-w-6xl flex-col gap-md px-xl py-lg lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex items-center gap-lg">
+            <span className="relative flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary-solid text-fg-white shadow-xs">
+              <Brain className="size-5" />
+              <span className="absolute -right-1 -top-1 size-2 rounded-full bg-utility-success-600 ring-2 ring-primary" />
             </span>
             <div>
-              <h1 className="text-heading-xs font-semibold text-primary">Bilateral Credit Dashboard</h1>
-              <p className="text-xs text-secondary">Peer-to-peer credit risk & memory limits for Alice & Bob</p>
+              <div className="flex items-center gap-sm">
+                <h1 className="text-lg font-semibold tracking-tight text-primary">Total Recall</h1>
+                <Badge tone={isWalrus ? 'success' : 'warning'} dot>
+                  {isWalrus ? 'Walrus Memory' : 'Demo memory'}
+                </Badge>
+              </div>
+              <p className="text-xs text-tertiary">Bilateral credit that is rebuilt from what happened.</p>
             </div>
           </div>
 
-          {/* Prominent Memory Switch Container */}
-          <div className="flex items-center gap-lg bg-secondary border border-secondary px-xl py-sm rounded-lg shadow-xs">
-            <div className="flex items-center gap-xs">
-              <Brain className={`size-5 shrink-0 ${memoryEnabled ? 'text-fg-brand-primary' : 'text-fg-quaternary'}`} />
-              <div className="text-left">
-                <span className="text-xs font-semibold block text-primary">
-                  Adaptive Memory
-                </span>
-                <span className="text-xs block text-secondary">
-                  {memoryEnabled ? 'Stateful memory ON' : 'Stateless evaluation OFF'}
-                </span>
+          <div className="flex flex-wrap items-center gap-md">
+            <div className="flex items-center gap-sm rounded-lg border border-secondary bg-secondary px-lg py-sm">
+              <div className="text-right">
+                <p className="text-[11px] font-semibold text-primary">Memory policy</p>
+                <p className="text-[10px] text-tertiary">{memoryEnabled ? 'ON · history enforced' : 'OFF · base 10 only'}</p>
               </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={memoryEnabled}
+                onClick={handleToggleMemory}
+                className={`flex h-6 w-11 items-center rounded-full p-xxs transition-colors focus-visible:ring-2 focus-visible:ring-focus-ring ${
+                  memoryEnabled ? 'bg-brand-solid' : 'bg-tertiary'
+                }`}
+              >
+                <span
+                  className={`size-4 rounded-full bg-primary shadow-xs transition-transform duration-200 ${
+                    memoryEnabled ? 'translate-x-5' : 'translate-x-0'
+                  }`}
+                  aria-hidden="true"
+                />
+              </button>
             </div>
-
-            {/* Switch component recipe */}
             <button
               type="button"
-              onClick={() => setMemoryEnabled(!memoryEnabled)}
-              className={`flex h-5 w-9 items-center rounded-full p-xxs transition-colors focus-visible:ring-2 focus-visible:ring-focus-ring ${
-                memoryEnabled ? 'bg-brand-solid' : 'bg-tertiary'
-              }`}
-              role="switch"
-              aria-checked={memoryEnabled}
+              onClick={handleVerify}
+              disabled={busy === 'verify'}
+              className="inline-flex items-center gap-sm rounded-lg border border-secondary bg-primary px-lg py-sm text-xs font-semibold text-secondary shadow-xs hover:bg-primary-hover disabled:opacity-50"
             >
-              <span
-                className={`size-4 rounded-full bg-primary shadow-xs transition-transform duration-200 ease-in-out ${
-                  memoryEnabled ? 'translate-x-4' : 'translate-x-0'
-                }`}
-                aria-hidden="true"
-              />
+              {busy === 'verify' ? <Loader2 className="size-4 animate-spin" /> : <Fingerprint className="size-4" />}
+              Verify rebuild
             </button>
           </div>
         </div>
+
+        <div className="mx-auto max-w-6xl px-xl">
+          <nav className="-mb-px flex gap-lg overflow-x-auto" aria-label="Sections">
+            {tabs.map(item => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setTab(item.id)}
+                className={`flex items-center gap-xs whitespace-nowrap border-b-2 px-md py-sm text-sm font-semibold transition-colors ${
+                  tab === item.id
+                    ? 'border-brand text-brand-primary'
+                    : 'border-transparent text-tertiary hover:text-secondary'
+                }`}
+              >
+                {item.icon}
+                {item.label}
+                {typeof item.count === 'number' && (
+                  <span className="ml-xs rounded-full bg-secondary px-sm py-xxs text-[10px] text-tertiary">{item.count}</span>
+                )}
+              </button>
+            ))}
+          </nav>
+        </div>
       </header>
 
-      {/* Tabs component recipe: baseline border-secondary, selected text-brand-primary + border-brand */}
-      <div className="border-b border-secondary bg-primary">
-        <div className="max-w-6xl mx-auto px-xl flex gap-lg overflow-x-auto">
-          <button
-            onClick={() => setActiveTab('dashboard')}
-            className={`border-b-2 px-md py-sm text-sm font-semibold transition-colors whitespace-nowrap flex items-center gap-xs ${
-              activeTab === 'dashboard'
-                ? 'border-brand text-brand-primary'
-                : 'border-transparent text-tertiary hover:text-secondary focus-visible:ring-2 focus-visible:ring-focus-ring'
-            }`}
-          >
-            <Coins className="size-4 shrink-0" />
-            Dashboard
-          </button>
-          <button
-            onClick={() => setActiveTab('request')}
-            className={`border-b-2 px-md py-sm text-sm font-semibold transition-colors whitespace-nowrap flex items-center gap-xs ${
-              activeTab === 'request'
-                ? 'border-brand text-brand-primary'
-                : 'border-transparent text-tertiary hover:text-secondary focus-visible:ring-2 focus-visible:ring-focus-ring'
-            }`}
-          >
-            <ArrowRightLeft className="size-4 shrink-0" />
-            Request Credit
-          </button>
-          <button
-            onClick={() => setActiveTab('decision')}
-            className={`border-b-2 px-md py-sm text-sm font-semibold transition-colors whitespace-nowrap flex items-center gap-xs ${
-              activeTab === 'decision'
-                ? 'border-brand text-brand-primary'
-                : 'border-transparent text-tertiary hover:text-secondary focus-visible:ring-2 focus-visible:ring-focus-ring'
-            }`}
-          >
-            <FileCheck2 className="size-4 shrink-0" />
-            Decision Engine
-          </button>
-          <button
-            onClick={() => setActiveTab('history')}
-            className={`border-b-2 px-md py-sm text-sm font-semibold transition-colors whitespace-nowrap flex items-center gap-xs ${
-              activeTab === 'history'
-                ? 'border-brand text-brand-primary'
-                : 'border-transparent text-tertiary hover:text-secondary focus-visible:ring-2 focus-visible:ring-focus-ring'
-            }`}
-          >
-            <History className="size-4 shrink-0" />
-            Audit History
-          </button>
-        </div>
-      </div>
-
-      {/* Main Content Area */}
-      <main className="max-w-6xl mx-auto w-full px-xl py-2xl flex-1">
-        {/* TAB 1: DASHBOARD */}
-        {activeTab === 'dashboard' && (
-          <div className="space-y-2xl">
-            {/* Alert component recipe: tinted callout */}
-            <div className={`flex gap-lg rounded-xl p-xl ${
-              memoryEnabled ? 'bg-utility-brand-50' : 'bg-utility-gray-50'
-            }`}>
-              <Brain className={`mt-xxs size-5 shrink-0 ${
-                memoryEnabled ? 'text-utility-brand-600' : 'text-utility-gray-600'
-              }`} />
-              <div>
-                <p className={`text-sm font-semibold ${
-                  memoryEnabled ? 'text-utility-brand-600' : 'text-utility-gray-600'
-                }`}>
-                  Memory Mode: {memoryEnabled ? 'Active (Historical Risk Context Enforced)' : 'Inactive (Stateless Mode)'}
-                </p>
-                <p className="mt-xxs text-sm text-tertiary">
-                  {memoryEnabled
-                    ? 'Credit decisions incorporate previous borrower repayments, defaults, and exposure track records to adjust limits dynamically.'
-                    : 'System evaluates only current hardcoded limit thresholds without memory tracking or reputation weights.'}
-                </p>
-              </div>
+      <main className="mx-auto max-w-6xl px-xl py-3xl">
+        {error && (
+          <div className="mb-xl flex items-start gap-md rounded-xl border border-utility-error-200 bg-utility-error-50 p-lg">
+            <XCircle className="mt-xxs size-5 shrink-0 text-fg-error-primary" />
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-utility-error-700">Something needs attention</p>
+              <p className="mt-xxs text-xs text-utility-error-700/80">{error}</p>
             </div>
-
-            {/* Bilateral Cards Grid using Card recipe (rounded-xl border border-secondary bg-primary p-xl shadow-xs) */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-xl">
-              {/* Alice -> Bob Card */}
-              <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs flex flex-col justify-between">
-                <div>
-                  <div className="flex items-center justify-between pb-md border-b border-secondary">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-wider text-secondary">Direction</p>
-                      <h2 className="text-heading-xs font-semibold text-primary">Alice → Bob</h2>
-                    </div>
-                    {/* Badge recipe */}
-                    <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
-                      Active Facility
-                    </span>
-                  </div>
-
-                  <div className="py-xl">
-                    <p className="text-sm text-tertiary">Available Credit Limit</p>
-                    <p className="mt-md text-heading-lg font-semibold text-primary">
-                      ${aliceToBobLimit.toLocaleString()}
-                    </p>
-                    <p className="text-xs text-tertiary mt-xs">
-                      Alice guarantees credit line to Bob up to this cap.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="pt-md border-t border-secondary space-y-sm">
-                  <p className="text-xs font-medium text-secondary">Simulate Bilateral Events</p>
-                  <div className="grid grid-cols-2 gap-sm">
-                    {/* Button secondary recipe */}
-                    <button
-                      type="button"
-                      onClick={() => handleRecordRepayment('alice_to_bob')}
-                      className="inline-flex items-center justify-center gap-sm rounded-lg bg-primary px-lg py-sm text-sm font-semibold text-secondary border border-primary shadow-xs hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
-                    >
-                      <RotateCcw className="size-4 text-fg-success-primary shrink-0" />
-                      Record repayment
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleRecordDefault('alice_to_bob')}
-                      className="inline-flex items-center justify-center gap-sm rounded-lg bg-primary px-lg py-sm text-sm font-semibold text-secondary border border-primary shadow-xs hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
-                    >
-                      <TrendingDown className="size-4 text-fg-error-primary shrink-0" />
-                      Record default
-                    </button>
-                  </div>
-                </div>
-              </section>
-
-              {/* Bob -> Alice Card */}
-              <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs flex flex-col justify-between">
-                <div>
-                  <div className="flex items-center justify-between pb-md border-b border-secondary">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-wider text-secondary">Direction</p>
-                      <h2 className="text-heading-xs font-semibold text-primary">Bob → Alice</h2>
-                    </div>
-                    {/* Badge recipe */}
-                    <span className="inline-flex items-center gap-xs rounded-full border border-utility-brand-200 bg-utility-brand-50 px-md py-xxs text-xs font-medium text-utility-brand-700">
-                      Active Facility
-                    </span>
-                  </div>
-
-                  <div className="py-xl">
-                    <p className="text-sm text-tertiary">Available Credit Limit</p>
-                    <p className="mt-md text-heading-lg font-semibold text-primary">
-                      ${bobToAliceLimit.toLocaleString()}
-                    </p>
-                    <p className="text-xs text-tertiary mt-xs">
-                      Bob guarantees credit line to Alice up to this cap.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="pt-md border-t border-secondary space-y-sm">
-                  <p className="text-xs font-medium text-secondary">Simulate Bilateral Events</p>
-                  <div className="grid grid-cols-2 gap-sm">
-                    {/* Button secondary recipe */}
-                    <button
-                      type="button"
-                      onClick={() => handleRecordRepayment('bob_to_alice')}
-                      className="inline-flex items-center justify-center gap-sm rounded-lg bg-primary px-lg py-sm text-sm font-semibold text-secondary border border-primary shadow-xs hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
-                    >
-                      <RotateCcw className="size-4 text-fg-success-primary shrink-0" />
-                      Record repayment
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleRecordDefault('bob_to_alice')}
-                      className="inline-flex items-center justify-center gap-sm rounded-lg bg-primary px-lg py-sm text-sm font-semibold text-secondary border border-primary shadow-xs hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
-                    >
-                      <TrendingDown className="size-4 text-fg-error-primary shrink-0" />
-                      Record default
-                    </button>
-                  </div>
-                </div>
-              </section>
+            <button type="button" onClick={() => setError(null)} className="text-xs font-semibold text-utility-error-700">
+              Dismiss
+            </button>
+          </div>
+        )}
+        {notice && (
+          <div className="mb-xl flex items-start gap-md rounded-xl border border-utility-success-200 bg-utility-success-50 p-lg">
+            <CheckCircle2 className="mt-xxs size-5 shrink-0 text-fg-success-primary" />
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-utility-success-700">Memory updated</p>
+              <p className="mt-xxs text-xs text-utility-success-700/80">{notice}</p>
             </div>
+            <button type="button" onClick={() => setNotice(null)} className="text-xs font-semibold text-utility-success-700">
+              Dismiss
+            </button>
+          </div>
+        )}
 
-            {/* Quick Actions Card */}
-            <section className="rounded-xl border border-secondary bg-primary p-xl shadow-xs flex flex-col sm:flex-row items-center justify-between gap-md">
-              <div>
-                <p className="text-sm font-semibold text-primary">Ready to evaluate a new transaction?</p>
-                <p className="mt-xxs text-sm text-tertiary">Submit a proposed credit draw and test the decision engine rules.</p>
-              </div>
-              {/* Button primary recipe */}
+        {!isWalrus && (
+          <div className="mb-xl flex flex-col gap-md rounded-xl border border-utility-warning-200 bg-utility-warning-50 p-lg sm:flex-row sm:items-center">
+            <AlertTriangle className="size-5 shrink-0 text-fg-warning-primary" />
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-utility-warning-700">Demo memory is active</p>
+              <p className="mt-xxs text-xs text-utility-warning-700/80">
+                The dashboard is running on an in-process MemWal mock. Add <code className="font-mono">MEMWAL_ACCOUNT_ID</code> and{' '}
+                <code className="font-mono">MEMWAL_PRIVATE_KEY</code> (or set <code className="font-mono">MEMWAL_MODE=live</code>) to write real blobs to the Walrus Memory relayer.
+              </p>
+            </div>
+            {memoryCount < 15 && (
               <button
-                onClick={() => setActiveTab('request')}
-                className="inline-flex items-center gap-sm rounded-lg border border-transparent bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
+                type="button"
+                onClick={handleSeed}
+                disabled={busy === 'seed'}
+                className="inline-flex items-center justify-center gap-sm rounded-lg bg-brand-solid px-lg py-sm text-xs font-semibold text-primary-on-brand hover:bg-brand-solid-hover disabled:opacity-60"
               >
-                Create Request
-                <ArrowRightLeft className="size-4 text-fg-white shrink-0" />
+                {busy === 'seed' ? <Loader2 className="size-4 animate-spin" /> : <Database className="size-4" />}
+                Seed 15 memories
               </button>
+            )}
+          </div>
+        )}
+
+        {tab === 'dashboard' && (
+          <div className="space-y-2xl">
+            <section className="grid gap-xl lg:grid-cols-[1.15fr_0.85fr]">
+              <div className="relative overflow-hidden rounded-2xl border border-secondary bg-primary p-2xl shadow-xs">
+                <div className="flex items-center gap-sm">
+                  <Badge tone="brand" dot>
+                    Consumer finance · Walrus Memory
+                  </Badge>
+                  <span className="text-[11px] text-tertiary">namespace: {state?.namespace ?? 'credit-demo'}</span>
+                </div>
+                <h2 className="mt-lg max-w-xl text-heading-md font-semibold leading-[1.1] tracking-tight text-primary">
+                  The limit is not stored.
+                  <br />
+                  It is <span className="text-brand-primary">remembered</span>.
+                </h2>
+                <p className="mt-md max-w-xl text-sm leading-6 text-secondary">
+                  Every repayment, default, advance, and fulfillment is a sentence in a shared Walrus Memory namespace.
+                  The credit engine is a pure function of that history. Restart the backend and the same blobs return the
+                  same number.
+                </p>
+                <div className="mt-xl flex flex-wrap items-center gap-sm">
+                  <button
+                    type="button"
+                    onClick={() => setTab('request')}
+                    className="inline-flex items-center gap-sm rounded-lg bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover"
+                  >
+                    Test a request <ArrowRight className="size-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleVerify}
+                    disabled={busy === 'verify'}
+                    className="inline-flex items-center gap-sm rounded-lg border border-secondary bg-primary px-lg py-sm text-sm font-semibold text-secondary shadow-xs hover:bg-primary-hover disabled:opacity-50"
+                  >
+                    {busy === 'verify' ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                    Re-recall &amp; compare
+                  </button>
+                  {verifyResult && (
+                    <span
+                      className={`inline-flex items-center gap-xs text-xs font-semibold ${
+                        verifyResult === 'match' ? 'text-utility-success-700' : 'text-utility-warning-700'
+                      }`}
+                    >
+                      {verifyResult === 'match' ? <CheckCircle2 className="size-4" /> : <AlertTriangle className="size-4" />}
+                      {verifyResult === 'match' ? 'Fingerprint matched' : 'Fingerprint changed'}
+                    </span>
+                  )}
+                </div>
+
+                <div className="mt-xl grid grid-cols-1 gap-sm border-t border-secondary pt-lg sm:grid-cols-3">
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-quaternary">Memories in policy</p>
+                    <p className="mt-xxs text-sm font-semibold text-primary tabular-nums">{memoryCount}</p>
+                  </div>
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-quaternary">State fingerprint</p>
+                    <p className="mt-xxs font-mono text-sm font-semibold text-primary">{state?.fingerprint.short ?? '—'}</p>
+                  </div>
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-quaternary">Last rebuild</p>
+                    <p className="mt-xxs text-sm font-semibold text-primary">{state ? timeAgo(state.lastUpdated) : '—'}</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl bg-primary-solid p-2xl text-white shadow-xs">
+                <div className="flex items-center justify-between">
+                  <Badge tone="success" dot>
+                    Live from Walrus
+                  </Badge>
+                  <Fingerprint className="size-5 text-white/40" />
+                </div>
+                <p className="mt-lg text-[11px] font-semibold uppercase tracking-[0.18em] text-white/50">Provenance</p>
+                <div className="mt-md space-y-sm text-sm">
+                  <div className="flex items-center justify-between gap-md border-b border-white/10 pb-sm">
+                    <span className="text-white/50">Mode</span>
+                    <span className="font-medium">{state?.mode === 'live' ? 'Walrus mainnet' : 'In-process mock'}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-md border-b border-white/10 pb-sm">
+                    <span className="text-white/50">Relayer</span>
+                    <span className="max-w-[190px] truncate font-mono text-xs" title={state?.relayer}>
+                      {state?.relayer}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-md border-b border-white/10 pb-sm">
+                    <span className="text-white/50">Namespace</span>
+                    <span className="font-mono text-xs">{state?.namespace}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-md border-b border-white/10 pb-sm">
+                    <span className="text-white/50">Account</span>
+                    <span className="font-mono text-xs">{state?.accountId ?? 'mock owner'}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-md">
+                    <span className="text-white/50">Recall window</span>
+                    <span className="font-mono text-xs">{state?.recallLimit ?? 100} memories</span>
+                  </div>
+                </div>
+                <div className="mt-lg rounded-lg border border-white/10 bg-white/5 p-md">
+                  <p className="text-[11px] leading-5 text-white/60">
+                    {state?.liveHint ?? 'Every read is rebuilt from the shared memory namespace.'}
+                  </p>
+                </div>
+                {memoryCount === 0 && (
+                  <button
+                    type="button"
+                    onClick={handleSeed}
+                    disabled={busy === 'seed'}
+                    className="mt-lg inline-flex w-full items-center justify-center gap-sm rounded-lg bg-white px-lg py-sm text-sm font-semibold text-primary hover:bg-white/90 disabled:opacity-60"
+                  >
+                    {busy === 'seed' ? <Loader2 className="size-4 animate-spin" /> : <Database className="size-4" />}
+                    Seed the first 15 memories
+                  </button>
+                )}
+              </div>
+            </section>
+
+            <section>
+              <SectionHeading
+                eyebrow="The two books"
+                title="Current reconstructed limits"
+                action={
+                  <div className="flex items-center gap-sm text-xs text-tertiary">
+                    <span className={`size-1.5 rounded-full ${memoryEnabled ? 'bg-utility-success-600' : 'bg-utility-gray-600'}`} />
+                    {memoryEnabled ? 'Memory on' : 'Memory off · base limit'}
+                  </div>
+                }
+              />
+              <div className="mt-lg grid gap-xl md:grid-cols-2">
+                <LimitCard
+                  directionKey="alice_to_bob"
+                  direction={state?.directions.alice_to_bob ?? {
+                    limit: 10,
+                    rawLimit: 10,
+                    breakdown: [],
+                    recentSuccesses: 0,
+                    recentBonus: 0,
+                    formula: {},
+                  }}
+                  memoryCount={state?.memoryEnabled ? memoryCount : 0}
+                  source={isWalrus ? 'walrus' : 'mock'}
+                  updatedAt={state?.lastUpdated ?? new Date().toISOString()}
+                />
+                <LimitCard
+                  directionKey="bob_to_alice"
+                  direction={state?.directions.bob_to_alice ?? {
+                    limit: 10,
+                    rawLimit: 10,
+                    breakdown: [],
+                    recentSuccesses: 0,
+                    recentBonus: 0,
+                    formula: {},
+                  }}
+                  memoryCount={state?.memoryEnabled ? memoryCount : 0}
+                  source={isWalrus ? 'walrus' : 'mock'}
+                  updatedAt={state?.lastUpdated ?? new Date().toISOString()}
+                />
+              </div>
+            </section>
+
+            <section className="grid gap-xl lg:grid-cols-[1.35fr_0.65fr]">
+              <div className="rounded-2xl border border-secondary bg-primary p-xl shadow-xs">
+                <div className="flex items-center justify-between gap-md">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">Evidence</p>
+                    <h3 className="mt-xxs text-heading-xs font-semibold text-primary">Latest remembered interactions</h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setTab('history')}
+                    className="inline-flex items-center gap-xs text-xs font-semibold text-brand-primary hover:underline"
+                  >
+                    Full ledger <ChevronRight className="size-4" />
+                  </button>
+                </div>
+                {latestEvidence.length === 0 ? (
+                  <div className="mt-lg rounded-xl border border-dashed border-primary bg-secondary p-2xl text-center">
+                    <p className="text-sm font-semibold text-primary">No credit memories yet</p>
+                    <p className="mt-xxs text-xs text-tertiary">Seed the namespace or write the first outcome.</p>
+                  </div>
+                ) : (
+                  <ul className="mt-lg space-y-sm">
+                    {latestEvidence.map(item => (
+                      <MemoryRow key={item.id} interaction={item} />
+                    ))}
+                  </ul>
+                )}
+              </div>
+
+              <div className="space-y-xl">
+                <FormulaPanel />
+                <div className="rounded-2xl border border-secondary bg-primary p-xl">
+                  <div className="flex items-center gap-sm">
+                    <Wallet className="size-4 text-fg-brand-primary" />
+                    <h3 className="text-sm font-semibold text-primary">Agent payment rail</h3>
+                  </div>
+                  <p className="mt-xs text-xs leading-5 text-tertiary">
+                    Tatum Sui gateway checks the reconstructed limit before it authorizes a tiny agent transfer.
+                  </p>
+                  <div className="mt-md space-y-xs text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-tertiary">Tatum</span>
+                      <span className="font-medium text-primary">
+                        {status?.tatum.status === 'connected' ? 'connected' : status?.tatum.status ?? 'checking'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-tertiary">Agent wallet</span>
+                      <span className="font-mono text-primary">
+                        {status?.payment.hasKey ? shortAddress(status.payment.balances?.address) : 'not configured'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-tertiary">Transfer</span>
+                      <span className="font-medium text-primary">
+                        {status?.payment.amount ?? 0.01} {status?.payment.symbol ?? 'SUI'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="mt-md rounded-lg bg-secondary p-md text-[11px] leading-5 text-tertiary">
+                    {status?.payment.hasKey
+                      ? 'Dry-run and execute become available on an ALLOW decision.'
+                      : 'Set SUI_AGENT_PRIVATE_KEY and TATUM_API_KEY to enable a live dry-run or transfer.'}
+                  </div>
+                </div>
+              </div>
             </section>
           </div>
         )}
 
-        {/* TAB 2: REQUEST FORM */}
-        {activeTab === 'request' && (
-          <section className="max-w-2xl mx-auto rounded-xl border border-secondary bg-primary p-2xl shadow-xs">
-            <div className="mb-xl pb-md border-b border-secondary">
-              <h2 className="text-heading-xs font-semibold text-primary">Submit Credit Request</h2>
-              <p className="text-xs text-secondary mt-xxs">
-                Initiate a credit draw between parties. The decision engine will compute eligibility based on current limits and memory mode.
-              </p>
-            </div>
-
-            <form onSubmit={handleEvaluateRequest} className="space-y-xl">
-              {/* Radio Group recipe */}
-              <div className="flex flex-col gap-sm">
-                <span className="text-sm font-medium text-secondary">Credit Direction</span>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-md">
-                  <label
-                    onClick={() => setReqDirection('alice_to_bob')}
-                    className={`flex items-center gap-sm p-md rounded-lg border cursor-pointer transition-colors ${
-                      reqDirection === 'alice_to_bob'
-                        ? 'border-brand bg-utility-brand-50'
-                        : 'border-primary bg-primary hover:bg-primary-hover'
-                    }`}
-                  >
-                    <span className={`flex size-4 shrink-0 items-center justify-center rounded-full border ${
-                      reqDirection === 'alice_to_bob' ? 'border-brand bg-primary' : 'border-primary bg-primary'
-                    }`}>
-                      {reqDirection === 'alice_to_bob' && (
-                        <span className="size-2 rounded-full bg-brand-solid" aria-hidden="true" />
-                      )}
-                    </span>
-                    <div>
-                      <span className="text-sm font-medium text-secondary block">Alice → Bob</span>
-                      <span className="text-xs text-tertiary block">Limit: ${aliceToBobLimit.toLocaleString()}</span>
-                    </div>
-                  </label>
-
-                  <label
-                    onClick={() => setReqDirection('bob_to_alice')}
-                    className={`flex items-center gap-sm p-md rounded-lg border cursor-pointer transition-colors ${
-                      reqDirection === 'bob_to_alice'
-                        ? 'border-brand bg-utility-brand-50'
-                        : 'border-primary bg-primary hover:bg-primary-hover'
-                    }`}
-                  >
-                    <span className={`flex size-4 shrink-0 items-center justify-center rounded-full border ${
-                      reqDirection === 'bob_to_alice' ? 'border-brand bg-primary' : 'border-primary bg-primary'
-                    }`}>
-                      {reqDirection === 'bob_to_alice' && (
-                        <span className="size-2 rounded-full bg-brand-solid" aria-hidden="true" />
-                      )}
-                    </span>
-                    <div>
-                      <span className="text-sm font-medium text-secondary block">Bob → Alice</span>
-                      <span className="text-xs text-tertiary block">Limit: ${bobToAliceLimit.toLocaleString()}</span>
-                    </div>
-                  </label>
-                </div>
+        {tab === 'request' && (
+          <section className="mx-auto max-w-3xl">
+            <SectionHeading
+              eyebrow="New credit request"
+              title="Ask the memory, not a database"
+              action={<Badge tone={memoryEnabled ? 'success' : 'gray'}>{memoryEnabled ? 'Memory on' : 'Memory off'}</Badge>}
+            />
+            <form onSubmit={handleEvaluate} className="mt-lg rounded-2xl border border-secondary bg-primary p-2xl shadow-xs">
+              <div className="grid gap-xl sm:grid-cols-2">
+                {(['alice_to_bob', 'bob_to_alice'] as Direction[]).map(direction => {
+                  const active = reqDirection === direction
+                  const limit = state?.limits[direction] ?? 10
+                  return (
+                    <button
+                      key={direction}
+                      type="button"
+                      onClick={() => setReqDirection(direction)}
+                      className={`rounded-xl border p-lg text-left transition-colors ${
+                        active
+                          ? 'border-brand bg-utility-brand-50'
+                          : 'border-secondary bg-primary hover:bg-primary-hover'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold text-primary">{DIRECTION_LABEL[direction]}</span>
+                        <span
+                          className={`flex size-4 items-center justify-center rounded-full border ${
+                            active ? 'border-brand bg-primary' : 'border-primary bg-primary'
+                          }`}
+                        >
+                          {active && <span className="size-2 rounded-full bg-brand-solid" />}
+                        </span>
+                      </div>
+                      <p className="mt-xs text-xs text-tertiary">
+                        Current limit <span className="font-semibold text-primary">{fmt(limit)} {CREDIT_UNIT}</span>
+                      </p>
+                    </button>
+                  )
+                })}
               </div>
 
-              {/* Input & Field recipe: label, control, hint */}
-              <div className="flex flex-col gap-sm">
-                <label htmlFor="req-amount" className="text-sm font-medium text-secondary">
-                  Requested Amount ($)
+              <div className="mt-xl">
+                <label htmlFor="amount" className="text-sm font-medium text-secondary">
+                  Requested amount ({CREDIT_UNIT})
                 </label>
-                <div className="relative">
+                <div className="mt-sm flex items-center rounded-lg border border-primary bg-primary focus-within:ring-2 focus-within:ring-focus-ring">
+                  <span className="pl-lg text-sm font-semibold text-tertiary">$</span>
                   <input
-                    id="req-amount"
+                    id="amount"
                     type="number"
-                    min="1"
-                    step="1"
+                    min="0.1"
+                    step="0.1"
                     value={reqAmount}
-                    onChange={(e) => setReqAmount(e.target.value)}
+                    onChange={event => setReqAmount(event.target.value)}
+                    className="w-full bg-transparent px-md py-lg text-heading-xs font-semibold text-primary outline-none tabular-nums"
                     required
-                    placeholder="e.g. 1200"
-                    className="w-full rounded-md bg-primary px-lg py-sm text-sm text-primary placeholder:text-placeholder border border-primary focus-visible:ring-2 focus-visible:ring-focus-ring"
                   />
+                  <span className="pr-lg text-xs font-medium text-tertiary">{CREDIT_UNIT}</span>
                 </div>
-                <p className="text-xs text-tertiary">Maximum single bilateral draw allowed by protocol rules.</p>
+                <div className="mt-sm flex flex-wrap gap-sm">
+                  {[5, 15, 25, 40, 100].map(value => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setReqAmount(String(value))}
+                      className={`rounded-full border px-md py-xxs text-xs font-semibold ${
+                        reqAmount === String(value)
+                          ? 'border-brand bg-utility-brand-50 text-utility-brand-700'
+                          : 'border-secondary bg-primary text-tertiary hover:bg-primary-hover'
+                      }`}
+                    >
+                      {value}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-sm text-xs text-tertiary">
+                  Alice → Bob currently allows <span className="font-semibold text-primary">{fmt(state?.limits.alice_to_bob ?? 10)}</span>;
+                  Bob → Alice allows <span className="font-semibold text-primary">{fmt(state?.limits.bob_to_alice ?? 10)}</span>.
+                </p>
               </div>
 
-              {/* Textarea Field */}
-              <div className="flex flex-col gap-sm">
-                <label htmlFor="req-purpose" className="text-sm font-medium text-secondary">
-                  Purpose of Credit
+              <div className="mt-xl">
+                <label htmlFor="purpose" className="text-sm font-medium text-secondary">
+                  Purpose
                 </label>
                 <textarea
-                  id="req-purpose"
-                  rows={3}
+                  id="purpose"
+                  rows={2}
                   value={reqPurpose}
-                  onChange={(e) => setReqPurpose(e.target.value)}
-                  placeholder="e.g. Liquidity bridge, inventory pre-funding, cross-party hedge"
-                  className="w-full rounded-md bg-primary px-lg py-sm text-sm text-primary placeholder:text-placeholder border border-primary focus-visible:ring-2 focus-visible:ring-focus-ring"
+                  onChange={event => setReqPurpose(event.target.value)}
+                  className="mt-sm w-full rounded-lg border border-primary bg-primary px-lg py-md text-sm text-primary outline-none placeholder:text-placeholder focus:ring-2 focus:ring-focus-ring"
+                  placeholder="e.g. settlement buffer for the next delivery"
                 />
-                <p className="text-xs text-tertiary">Evidence logging requirement for bilateral transparency.</p>
               </div>
 
-              {/* Status Notice */}
-              <div className="flex gap-md rounded-xl bg-utility-brand-50 p-md items-center">
-                <Brain className="size-5 shrink-0 text-utility-brand-600" />
+              <div className="mt-xl flex items-start gap-md rounded-xl bg-utility-brand-50 p-md">
+                <Brain className="mt-xxs size-5 shrink-0 text-fg-brand-primary" />
                 <div>
-                  <p className="text-sm font-semibold text-utility-brand-600">
-                    Memory Status: {memoryEnabled ? 'Enabled' : 'Bypassed'}
+                  <p className="text-sm font-semibold text-utility-brand-700">
+                    {memoryEnabled ? 'History will decide this request' : 'History is bypassed'}
                   </p>
-                  <p className="text-xs text-tertiary">
-                    {memoryEnabled ? 'Historical defaults and repayments will influence final verdict.' : 'Decisions will only evaluate available credit ceiling.'}
+                  <p className="mt-xxs text-xs text-tertiary">
+                    {memoryEnabled
+                      ? `The server will recall the ${state?.namespace ?? 'credit-demo'} namespace and recompute both limits before answering.`
+                      : 'The engine will use only the base limit of 10 and return no evidence.'}
                   </p>
                 </div>
               </div>
 
-              {/* Submit Button (primary) */}
               <button
                 type="submit"
-                className="w-full inline-flex items-center justify-center gap-sm rounded-lg border border-transparent bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
+                disabled={busy === 'evaluate'}
+                className="mt-xl inline-flex w-full items-center justify-center gap-sm rounded-lg bg-brand-solid px-lg py-lg text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover disabled:opacity-60"
               >
-                <FileCheck2 className="size-4 text-fg-white shrink-0" />
-                Run Decision Engine
+                {busy === 'evaluate' ? <Spinner label="Recalling from Walrus…" /> : <FileCheck2 className="size-4" />}
+                {busy === 'evaluate' ? '' : 'Check the limit'}
               </button>
             </form>
           </section>
         )}
 
-        {/* TAB 3: DECISION PAGE */}
-        {activeTab === 'decision' && (
-          <div className="max-w-3xl mx-auto space-y-xl">
-            {/* Verdict Card */}
-            <section className="rounded-xl border border-secondary bg-primary p-2xl shadow-xs">
-              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between pb-lg border-b border-secondary gap-md">
-                <div>
-                  <p className="text-xs font-semibold uppercase tracking-wider text-secondary">
-                    Credit Decision Report
-                  </p>
-                  <h2 className="text-heading-sm font-semibold text-primary mt-xxs">
-                    {latestDecision.direction === 'alice_to_bob' ? 'Alice → Bob' : 'Bob → Alice'} Transaction
-                  </h2>
-                </div>
-
-                {/* Badge component recipes */}
-                <div>
-                  {latestDecision.verdict === 'ALLOW' && (
-                    <span className="inline-flex items-center gap-xs rounded-full border border-utility-success-200 bg-utility-success-50 px-md py-xxs text-xs font-medium text-utility-success-700">
-                      <CheckCircle2 className="size-4 text-fg-success-primary shrink-0" />
-                      ALLOW
-                    </span>
-                  )}
-                  {latestDecision.verdict === 'REDUCE' && (
-                    <span className="inline-flex items-center gap-xs rounded-full border border-utility-warning-200 bg-utility-warning-50 px-md py-xxs text-xs font-medium text-utility-warning-700">
-                      <AlertTriangle className="size-4 text-fg-warning-primary shrink-0" />
-                      REDUCE
-                    </span>
-                  )}
-                  {latestDecision.verdict === 'BLOCK' && (
-                    <span className="inline-flex items-center gap-xs rounded-full border border-utility-error-200 bg-utility-error-50 px-md py-xxs text-xs font-medium text-utility-error-700">
-                      <XCircle className="size-4 text-fg-error-primary shrink-0" />
-                      BLOCK
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              {/* Decision Metrics Group */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-md py-xl border-b border-secondary">
-                <div className="bg-secondary p-md rounded-lg border border-secondary">
-                  <p className="text-sm text-tertiary">Requested</p>
-                  <p className="mt-xs text-heading-xs font-semibold text-primary">
-                    ${latestDecision.amount.toLocaleString()}
-                  </p>
-                </div>
-                <div className="bg-secondary p-md rounded-lg border border-secondary">
-                  <p className="text-sm text-tertiary">Calculated Limit</p>
-                  <p className="mt-xs text-heading-xs font-semibold text-primary">
-                    ${latestDecision.calculatedLimit.toLocaleString()}
-                  </p>
-                </div>
-                <div className="bg-secondary p-md rounded-lg border border-secondary">
-                  <p className="text-sm text-tertiary">Memory Engine</p>
-                  <p className="mt-xs text-sm font-semibold text-primary">
-                    {latestDecision.memoryActive ? 'Active Factor' : 'Bypassed'}
-                  </p>
-                </div>
-              </div>
-
-              {/* Purpose display */}
-              <div className="py-md border-b border-secondary">
-                <p className="text-xs font-medium text-secondary">Stated Purpose</p>
-                <p className="text-sm text-primary mt-xxs">{latestDecision.purpose}</p>
-              </div>
-
-              {/* Evidence Section */}
-              <div className="pt-xl">
-                <div className="flex items-center gap-xs mb-md">
-                  <ShieldCheck className="size-4 text-fg-brand-primary shrink-0" />
-                  <h3 className="text-sm font-semibold text-primary">Rules & Evidence Trail</h3>
-                </div>
-
-                <ul className="space-y-sm">
-                  {latestDecision.evidence.map((item, index) => (
-                    <li
-                      key={index}
-                      className="flex items-start gap-sm p-sm rounded-lg bg-secondary border border-secondary text-xs text-secondary"
-                    >
-                      <span className="flex size-5 items-center justify-center rounded-full bg-utility-brand-50 border border-utility-brand-200 text-utility-brand-700 font-bold text-xs shrink-0 mt-0.5">
-                        {index + 1}
-                      </span>
-                      <span>{item}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-
-              {/* Decision Action Links */}
-              <div className="mt-xl pt-lg border-t border-secondary flex items-center justify-end gap-md">
+        {tab === 'decision' && (
+          <div className="mx-auto max-w-4xl space-y-xl">
+            {!decision ? (
+              <div className="rounded-2xl border border-dashed border-primary bg-primary p-3xl text-center">
+                <FileCheck2 className="mx-auto size-8 text-fg-quaternary" />
+                <h2 className="mt-md text-heading-xs font-semibold text-primary">No decision yet</h2>
+                <p className="mt-xxs text-sm text-tertiary">Submit a credit request and the evidence will appear here.</p>
                 <button
                   type="button"
-                  onClick={() => setActiveTab('request')}
-                  className="inline-flex items-center gap-sm rounded-lg bg-primary px-lg py-sm text-sm font-semibold text-secondary border border-primary shadow-xs hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
+                  onClick={() => setTab('request')}
+                  className="mt-lg inline-flex items-center gap-sm rounded-lg bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand"
                 >
-                  New Request
+                  Request credit <ArrowRight className="size-4" />
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('history')}
-                  className="inline-flex items-center gap-sm rounded-lg border border-transparent bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand shadow-xs hover:bg-brand-solid-hover focus-visible:ring-2 focus-visible:ring-focus-ring"
-                >
-                  View All History
-                </button>
-              </div>
-            </section>
-          </div>
-        )}
-
-        {/* TAB 4: TABLE (using Table recipe: rounded-xl border border-secondary bg-primary) */}
-        {activeTab === 'history' && (
-          <div className="overflow-hidden rounded-xl border border-secondary bg-primary shadow-xs">
-            <div className="p-xl border-b border-secondary flex items-center justify-between">
-              <div>
-                <h2 className="text-heading-xs font-semibold text-primary">Transaction & Audit History</h2>
-                <p className="text-xs text-secondary mt-xxs">Chronological log of credit requests, repayments, and defaults</p>
-              </div>
-              <span className="inline-flex items-center gap-xs rounded-full border border-utility-gray-200 bg-utility-gray-50 px-md py-xxs text-xs font-medium text-utility-gray-700">
-                {history.length} records
-              </span>
-            </div>
-
-            {history.length === 0 ? (
-              <div className="py-2xl text-center text-secondary text-sm">
-                No activity records recorded yet.
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full">
-                  <thead className="bg-secondary">
-                    <tr className="border-b border-secondary text-left">
-                      <th className="px-xl py-md text-sm font-semibold text-quaternary">Party & Details</th>
-                      <th className="px-xl py-md text-sm font-semibold text-quaternary">Timestamp</th>
-                      <th className="px-xl py-md text-sm font-semibold text-quaternary">Type</th>
-                      <th className="px-xl py-md text-sm font-semibold text-quaternary">Amount</th>
-                      <th className="px-xl py-md text-sm font-semibold text-quaternary text-right">Verdict / Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {history.map((item) => (
-                      <tr key={item.id} className="border-b border-secondary hover:bg-secondary-hover transition-colors">
-                        <td className="px-xl py-lg text-sm">
-                          <p className="font-semibold text-primary">
-                            {item.direction === 'alice_to_bob' ? 'Alice → Bob' : 'Bob → Alice'}
-                          </p>
-                          <p className="text-xs text-tertiary mt-xxs">{item.purpose || 'Credit operation'}</p>
-                        </td>
-                        <td className="px-xl py-lg text-sm text-tertiary">
-                          {item.timestamp}
-                        </td>
-                        <td className="px-xl py-lg text-sm text-tertiary uppercase font-mono text-xs">
-                          {item.type}
-                        </td>
-                        <td className="px-xl py-lg text-sm font-semibold text-primary">
-                          ${item.amount.toLocaleString()}
-                        </td>
-                        <td className="px-xl py-lg text-right">
-                          {item.status === 'ALLOW' && (
-                            <span className="inline-flex items-center gap-xs rounded-full border border-utility-success-200 bg-utility-success-50 px-md py-xxs text-xs font-medium text-utility-success-700">
-                              ALLOW
-                            </span>
-                          )}
-                          {item.status === 'REDUCE' && (
-                            <span className="inline-flex items-center gap-xs rounded-full border border-utility-warning-200 bg-utility-warning-50 px-md py-xxs text-xs font-medium text-utility-warning-700">
-                              REDUCE
-                            </span>
-                          )}
-                          {item.status === 'BLOCK' && (
-                            <span className="inline-flex items-center gap-xs rounded-full border border-utility-error-200 bg-utility-error-50 px-md py-xxs text-xs font-medium text-utility-error-700">
-                              BLOCK
-                            </span>
-                          )}
-                          {item.status === 'RECORDED' && (
-                            <span className="inline-flex items-center gap-xs rounded-full border border-utility-gray-200 bg-utility-gray-50 px-md py-xxs text-xs font-medium text-utility-gray-700">
-                              RECORDED
-                            </span>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <>
+                <section
+                  className={`rounded-2xl border p-2xl shadow-xs ${
+                    decision.verdict === 'ALLOW'
+                      ? 'border-utility-success-200 bg-utility-success-50'
+                      : decision.verdict === 'REDUCE'
+                        ? 'border-utility-warning-200 bg-utility-warning-50'
+                        : 'border-utility-error-200 bg-utility-error-50'
+                  }`}
+                >
+                  <div className="flex flex-col gap-md sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">Decision report</p>
+                      <p className="mt-xxs text-sm font-medium text-secondary">
+                        {decision.label} · {decision.purpose}
+                      </p>
+                      <p
+                        className={`mt-md text-heading-2xl font-semibold leading-none tracking-tight ${
+                          decision.verdict === 'ALLOW'
+                            ? 'text-utility-success-700'
+                            : decision.verdict === 'REDUCE'
+                              ? 'text-utility-warning-700'
+                              : 'text-utility-error-700'
+                        }`}
+                      >
+                        {decision.verdict}
+                      </p>
+                      <p className="mt-sm max-w-xl text-sm text-secondary">{decision.reason}</p>
+                    </div>
+                    <div className="flex flex-col items-start gap-sm sm:items-end">
+                      <VerdictBadge verdict={decision.verdict} />
+                      <Badge tone={decision.source === 'walrus' ? 'success' : 'warning'} dot>
+                        {decision.source === 'walrus' ? 'Rebuilt from Walrus' : 'Rebuilt from demo memory'}
+                      </Badge>
+                      <span className="font-mono text-[11px] text-tertiary">{decision.fingerprint.short}</span>
+                    </div>
+                  </div>
+
+                  <div className="mt-xl grid grid-cols-2 gap-md border-t border-black/5 pt-xl sm:grid-cols-4">
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wide text-tertiary">Requested</p>
+                      <p className="mt-xxs text-lg font-semibold text-primary tabular-nums">{fmtAmount(decision.amount)}</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wide text-tertiary">Reconstructed limit</p>
+                      <p className="mt-xxs text-lg font-semibold text-primary tabular-nums">{fmt(decision.limit)}</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wide text-tertiary">Approved</p>
+                      <p className="mt-xxs text-lg font-semibold text-primary tabular-nums">{fmt(decision.approvedAmount)}</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] uppercase tracking-wide text-tertiary">Memories</p>
+                      <p className="mt-xxs text-lg font-semibold text-primary tabular-nums">{decision.memoryCount}</p>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="grid gap-xl md:grid-cols-2">
+                  <div className="rounded-2xl border border-secondary bg-primary p-xl">
+                    <div className="flex items-center gap-sm">
+                      <Brain className="size-4 text-fg-brand-primary" />
+                      <h3 className="text-sm font-semibold text-primary">With memory</h3>
+                    </div>
+                    <p className="mt-md text-heading-xs font-semibold text-primary tabular-nums">
+                      {fmt(decision.memoryOn?.limit ?? decision.limit)}
+                    </p>
+                    <p className="mt-xxs text-xs text-tertiary">
+                      {(decision.memoryOn?.recentSuccesses ?? decision.recentSuccesses)} recent successes · +
+                      {fmt(decision.memoryOn?.recentBonus ?? decision.recentBonus)} recency bonus
+                    </p>
+                    <div className="mt-md">
+                      <VerdictBadge verdict={decision.memoryOn?.verdict ?? decision.verdict} />
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-secondary bg-secondary p-xl">
+                    <div className="flex items-center gap-sm">
+                      <Database className="size-4 text-fg-quaternary" />
+                      <h3 className="text-sm font-semibold text-primary">Without memory</h3>
+                    </div>
+                    <p className="mt-md text-heading-xs font-semibold text-tertiary tabular-nums">{fmt(decision.memoryOff.limit)}</p>
+                    <p className="mt-xxs text-xs text-tertiary">Base limit only · no history · no evidence</p>
+                    <div className="mt-md">
+                      <VerdictBadge verdict={decision.memoryOff.verdict} />
+                    </div>
+                  </div>
+                </section>
+
+                <section className="rounded-2xl border border-secondary bg-primary p-xl shadow-xs">
+                  <div className="flex flex-col gap-sm sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex items-center gap-sm">
+                      <ShieldCheck className="size-4 text-fg-brand-primary" />
+                      <h3 className="text-sm font-semibold text-primary">Evidence used</h3>
+                    </div>
+                    <span className="text-xs text-tertiary">
+                      {decision.memoryEnabled
+                        ? `${decision.relevant.length} recalled · ${decision.breakdown.length} scored`
+                        : 'memory off · base limit applied'}
+                    </span>
+                  </div>
+                  {decision.relevant.length === 0 ? (
+                    <div className="mt-md rounded-xl border border-dashed border-primary bg-secondary p-xl text-center text-sm text-tertiary">
+                      Memory is off, so there is no evidence trail.
+                    </div>
+                  ) : (
+                    <ul className="mt-md space-y-sm">
+                      {decision.relevant
+                        .slice()
+                        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+                        .map(item => {
+                          const scored = decision.breakdown.find(b => b.blobId === item.blobId)
+                          return <MemoryRow key={item.id} interaction={item} delta={scored?.delta} compact />
+                        })}
+                    </ul>
+                  )}
+                  <div className="mt-lg rounded-xl bg-secondary p-md">
+                    {decision.memoryEnabled ? (
+                      <p className="font-mono text-[11px] leading-5 text-secondary">
+                        limit = 10 + repayments − defaults − drawdowns + recency ={' '}
+                        <span className="font-semibold text-primary">{fmt(decision.limit)}</span>
+                      </p>
+                    ) : (
+                      <p className="font-mono text-[11px] leading-5 text-secondary">
+                        limit = <span className="font-semibold text-primary">10</span> (memory off · nothing recalled
+                        or scored)
+                      </p>
+                    )}
+                  </div>
+                </section>
+
+                <section className="grid gap-xl lg:grid-cols-[1fr_1fr]">
+                  <div className="rounded-2xl border border-secondary bg-primary p-xl shadow-xs">
+                    <div className="flex items-center gap-sm">
+                      <FileCheck2 className="size-4 text-fg-brand-primary" />
+                      <h3 className="text-sm font-semibold text-primary">Write the outcome</h3>
+                    </div>
+                    <p className="mt-xs text-xs leading-5 text-tertiary">
+                      This writes one new memory, then immediately recomputes the limit. A repayment should lift it; a
+                      default should cut it.
+                    </p>
+                    <input
+                      type="text"
+                      value={outcomeNote}
+                      onChange={event => setOutcomeNote(event.target.value)}
+                      placeholder="Optional note (e.g. paid on time)"
+                      className="mt-md w-full rounded-lg border border-primary bg-primary px-lg py-sm text-sm text-primary outline-none placeholder:text-placeholder focus:ring-2 focus:ring-focus-ring"
+                    />
+                    <div className="mt-md grid gap-sm sm:grid-cols-3">
+                      <button
+                        type="button"
+                        onClick={() => handleRecord('repayment')}
+                        disabled={Boolean(busy)}
+                        className="inline-flex flex-col items-start gap-xxs rounded-lg border border-utility-success-200 bg-utility-success-50 px-lg py-md text-left hover:bg-utility-success-50/70 disabled:opacity-60"
+                      >
+                        <span className="inline-flex items-center gap-xs text-xs font-semibold text-utility-success-700">
+                          {busy === 'record-repayment' ? <Loader2 className="size-3.5 animate-spin" /> : <TrendingUp className="size-3.5" />}
+                          Repayment
+                        </span>
+                        <span className="text-[10px] text-utility-success-700/70">borrower → lender</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleRecord('default')}
+                        disabled={Boolean(busy)}
+                        className="inline-flex flex-col items-start gap-xxs rounded-lg border border-utility-error-200 bg-utility-error-50 px-lg py-md text-left hover:bg-utility-error-50/70 disabled:opacity-60"
+                      >
+                        <span className="inline-flex items-center gap-xs text-xs font-semibold text-utility-error-700">
+                          {busy === 'record-default' ? <Loader2 className="size-3.5 animate-spin" /> : <TrendingDown className="size-3.5" />}
+                          Default
+                        </span>
+                        <span className="text-[10px] text-utility-error-700/70">borrower → lender</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleRecord('advance')}
+                        disabled={Boolean(busy)}
+                        className="inline-flex flex-col items-start gap-xxs rounded-lg border border-utility-brand-200 bg-utility-brand-50 px-lg py-md text-left hover:bg-utility-brand-50/70 disabled:opacity-60"
+                      >
+                        <span className="inline-flex items-center gap-xs text-xs font-semibold text-utility-brand-700">
+                          {busy === 'record-advance' ? <Loader2 className="size-3.5 animate-spin" /> : <Coins className="size-3.5" />}
+                          Advance
+                        </span>
+                        <span className="text-[10px] text-utility-brand-700/70">lender → borrower</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-secondary bg-primary p-xl shadow-xs">
+                    <div className="flex items-center justify-between gap-sm">
+                      <div className="flex items-center gap-sm">
+                        <Wallet className="size-4 text-fg-brand-primary" />
+                        <h3 className="text-sm font-semibold text-primary">Release agent payment</h3>
+                      </div>
+                      <Badge tone={decision.verdict === 'ALLOW' ? 'success' : 'gray'}>
+                        {decision.verdict === 'ALLOW' ? 'Policy open' : 'Locked by policy'}
+                      </Badge>
+                    </div>
+                    <p className="mt-xs text-xs leading-5 text-tertiary">
+                      {decision.verdict === 'ALLOW'
+                        ? `The reconstructed limit covers the tiny ${status?.payment.amount ?? 0.05} ${status?.payment.symbol ?? 'SUI'} agent transfer. Tatum runs the Sui gateway check.`
+                        : 'No agent payment is offered while the request is outside the reconstructed limit.'}
+                    </p>
+
+                    {decision.verdict === 'ALLOW' ? (
+                      <div className="mt-md space-y-sm">
+                        <div className="flex items-center justify-between rounded-lg bg-secondary p-md text-xs">
+                          <span className="text-tertiary">Payment</span>
+                          <span className="font-semibold text-primary">
+                            {status?.payment.amount ?? 0.05} {status?.payment.symbol ?? 'SUI'}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between rounded-lg bg-secondary p-md text-xs">
+                          <span className="text-tertiary">Agent wallet</span>
+                          <span className="font-mono text-primary">
+                            {status?.payment.hasKey ? shortAddress(status.payment.balances?.address) : 'not configured'}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleAuthorizePayment}
+                          disabled={busy === 'authorize' || busy === 'execute'}
+                          className="inline-flex w-full items-center justify-center gap-sm rounded-lg border border-secondary bg-primary px-lg py-sm text-sm font-semibold text-secondary shadow-xs hover:bg-primary-hover disabled:opacity-60"
+                        >
+                          {busy === 'authorize' ? <Loader2 className="size-4 animate-spin" /> : <ShieldCheck className="size-4" />}
+                          Authorize with Tatum
+                        </button>
+                        {paymentAuth && (
+                          <div className="rounded-lg border border-secondary bg-secondary p-md text-xs">
+                            <div className="flex items-center justify-between">
+                              <span className="text-tertiary">Authorization</span>
+                              <span className="font-semibold text-utility-success-700">
+                                {paymentAuth.allowed ? 'ALLOW' : 'BLOCK'}
+                              </span>
+                            </div>
+                            <p className="mt-xxs text-tertiary">{paymentAuth.reason}</p>
+                            {paymentAuth.payment?.dryRun && (
+                              <p className="mt-xs font-mono text-[11px] text-primary">
+                                dry-run: {paymentAuth.payment.dryRun.status}
+                              </p>
+                            )}
+                            {paymentAuth.payment?.mode === 'authorization-only' && (
+                              <p className="mt-xs text-[11px] text-utility-warning-700">{paymentAuth.payment.message}</p>
+                            )}
+                          </div>
+                        )}
+                        {paymentAuth?.payment?.mode === 'dry-run' && paymentAuth.payment.dryRun?.success && (
+                          <button
+                            type="button"
+                            onClick={handleExecutePayment}
+                            disabled={busy === 'execute'}
+                            className="inline-flex w-full items-center justify-center gap-sm rounded-lg bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand hover:bg-brand-solid-hover disabled:opacity-60"
+                          >
+                            {busy === 'execute' ? <Loader2 className="size-4 animate-spin" /> : <ArrowRight className="size-4" />}
+                            Execute {paymentAuth.paymentAmount} {paymentAuth.symbol}
+                          </button>
+                        )}
+                        {paymentExec && (
+                          <div className="rounded-lg border border-utility-success-200 bg-utility-success-50 p-md text-xs">
+                            <p className="font-semibold text-utility-success-700">
+                              {paymentExec.execution?.success ? 'Payment settled' : 'Payment failed'}
+                            </p>
+                            {paymentExec.digest && (
+                              <div className="mt-xs flex items-center gap-xs">
+                                <span className="font-mono text-[10px] text-utility-success-700">{shortBlob(paymentExec.digest)}</span>
+                                <CopyButton value={paymentExec.digest} label="Digest" />
+                                {paymentExec.explorerUrl && (
+                                  <a
+                                    href={paymentExec.explorerUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-[10px] font-semibold text-utility-success-700 underline"
+                                  >
+                                    Explorer
+                                  </a>
+                                )}
+                              </div>
+                            )}
+                            {paymentExec.memoryError && (
+                              <p className="mt-xs text-[10px] text-utility-warning-700">Memory write failed: {paymentExec.memoryError}</p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="mt-md flex items-start gap-sm rounded-lg bg-secondary p-md text-xs text-tertiary">
+                        <Lock className="mt-xxs size-4 shrink-0" />
+                        <span>
+                          The button is intentionally absent. A payment only becomes executable when the recalled
+                          history reconstructs a limit that covers it.
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </section>
+
+                <div className="flex flex-col gap-sm sm:flex-row sm:justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setTab('request')}
+                    className="inline-flex items-center justify-center gap-sm rounded-lg border border-secondary bg-primary px-lg py-sm text-sm font-semibold text-secondary hover:bg-primary-hover"
+                  >
+                    New request
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTab('history')}
+                    className="inline-flex items-center justify-center gap-sm rounded-lg bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand hover:bg-brand-solid-hover"
+                  >
+                    Open memory ledger <ArrowRight className="size-4" />
+                  </button>
+                </div>
+              </>
             )}
           </div>
         )}
+
+        {tab === 'history' && (
+          <section className="space-y-xl">
+            <SectionHeading
+              eyebrow="Shared namespace"
+              title="Memory ledger"
+              action={
+                <div className="flex flex-wrap items-center gap-sm">
+                  <Badge tone={isWalrus ? 'success' : 'warning'} dot>
+                    {isWalrus ? 'Walrus Memory' : 'Demo memory'}
+                  </Badge>
+                  <span className="font-mono text-[11px] text-tertiary">{history?.fingerprint.short ?? state?.fingerprint.short}</span>
+                </div>
+              }
+            />
+
+            <div className="flex flex-wrap gap-sm">
+              {[
+                ['all', 'All'],
+                ['repayment', 'Repayments'],
+                ['default', 'Defaults'],
+                ['advance', 'Advances'],
+                ['fulfillment', 'Fulfillments'],
+              ].map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => handleFilter(value)}
+                  disabled={busy === 'history'}
+                  className={`rounded-full border px-lg py-xs text-xs font-semibold transition-colors ${
+                    historyFilter === value
+                      ? 'border-brand bg-utility-brand-50 text-utility-brand-700'
+                      : 'border-secondary bg-primary text-tertiary hover:bg-primary-hover'
+                  }`}
+                >
+                  {label}
+                  <span className="ml-xs text-[10px] opacity-70">
+                    {value === 'all' ? history?.namespaceTotal ?? 0 : history?.counts[value] ?? 0}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            <div className="overflow-hidden rounded-2xl border border-secondary bg-primary shadow-xs">
+              <div className="flex flex-col gap-sm border-b border-secondary p-xl sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-primary">
+                    {history?.total ?? 0} {historyFilter === 'all' ? 'memories' : `${historyFilter} memories`}
+                  </p>
+                  <p className="mt-xxs text-xs text-tertiary">
+                    Re-read from {state?.relayer} · namespace {state?.namespace}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => refreshAll(historyFilter)}
+                  disabled={busy === 'state'}
+                  className="inline-flex items-center gap-sm rounded-lg border border-secondary bg-primary px-lg py-sm text-xs font-semibold text-secondary hover:bg-primary-hover disabled:opacity-60"
+                >
+                  {busy === 'state' ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                  Re-read from Walrus
+                </button>
+              </div>
+
+              {!history || history.interactions.length === 0 ? (
+                <div className="p-3xl text-center">
+                  <Database className="mx-auto size-8 text-fg-quaternary" />
+                  <p className="mt-md text-sm font-semibold text-primary">No memories in this filter</p>
+                  <p className="mt-xxs text-xs text-tertiary">Write an outcome from a decision, or seed the demo set.</p>
+                  <button
+                    type="button"
+                    onClick={handleSeed}
+                    disabled={busy === 'seed'}
+                    className="mt-lg inline-flex items-center gap-sm rounded-lg bg-brand-solid px-lg py-sm text-sm font-semibold text-primary-on-brand disabled:opacity-60"
+                  >
+                    {busy === 'seed' ? <Loader2 className="size-4 animate-spin" /> : <Database className="size-4" />}
+                    Seed 15 memories
+                  </button>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead className="bg-secondary">
+                      <tr className="border-b border-secondary text-left">
+                        <th className="px-xl py-md text-[11px] font-semibold uppercase tracking-wide text-quaternary">Memory</th>
+                        <th className="px-xl py-md text-[11px] font-semibold uppercase tracking-wide text-quaternary">Flow</th>
+                        <th className="px-xl py-md text-[11px] font-semibold uppercase tracking-wide text-quaternary">Amount</th>
+                        <th className="px-xl py-md text-[11px] font-semibold uppercase tracking-wide text-quaternary">Result</th>
+                        <th className="px-xl py-md text-[11px] font-semibold uppercase tracking-wide text-quaternary">Blob</th>
+                        <th className="px-xl py-md text-[11px] font-semibold uppercase tracking-wide text-quaternary">When</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {history.interactions
+                        .slice()
+                        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+                        .map(item => (
+                          <tr key={item.id} className="border-b border-secondary last:border-0 hover:bg-secondary-hover">
+                            <td className="px-xl py-lg">
+                              <div className="flex items-center gap-sm">
+                                <span
+                                  className={`flex size-7 items-center justify-center rounded-full border ${
+                                    item.type === 'repayment'
+                                      ? 'border-utility-success-200 bg-utility-success-50 text-utility-success-700'
+                                      : item.type === 'default'
+                                        ? 'border-utility-error-200 bg-utility-error-50 text-utility-error-700'
+                                        : item.type === 'advance'
+                                          ? 'border-utility-brand-200 bg-utility-brand-50 text-utility-brand-700'
+                                          : 'border-utility-gray-200 bg-utility-gray-50 text-utility-gray-700'
+                                  }`}
+                                >
+                                  {typeIcon(item.type)}
+                                </span>
+                                <div>
+                                  <p className="text-xs font-semibold capitalize text-primary">{item.type}</p>
+                                  <p className="max-w-[260px] truncate text-[11px] text-tertiary">{item.note || item.text}</p>
+                                </div>
+                              </div>
+                            </td>
+                            <td className="px-xl py-lg text-xs text-secondary">
+                              {item.from} → {item.to}
+                            </td>
+                            <td className="px-xl py-lg text-xs font-semibold text-primary tabular-nums">{fmtAmount(item.amount)}</td>
+                            <td className="px-xl py-lg">
+                              <Badge tone={item.result === 'success' ? 'success' : item.result === 'failed' ? 'error' : 'warning'}>
+                                {item.result}
+                              </Badge>
+                            </td>
+                            <td className="px-xl py-lg">
+                              <div className="flex items-center gap-xs">
+                                <span className="font-mono text-[10px] text-tertiary" title={item.blobId ?? undefined}>
+                                  {shortBlob(item.blobId)}
+                                </span>
+                                {item.blobId && <CopyButton value={item.blobId} label="Blob" />}
+                              </div>
+                            </td>
+                            <td className="px-xl py-lg text-[11px] text-tertiary">{fmtDate(item.timestamp)}</td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-sm rounded-xl border border-secondary bg-primary p-lg text-xs text-tertiary sm:flex-row sm:items-center sm:justify-between">
+              <span>
+                Full memory text is stored in the blob. The dashboard parses tags from the recalled sentence; it never
+                keeps a local copy.
+              </span>
+              <span className="font-mono text-[10px]">{history?.fingerprint.full ?? state?.fingerprint.full}</span>
+            </div>
+          </section>
+        )}
       </main>
+
+      <footer className="border-t border-secondary bg-primary">
+        <div className="mx-auto flex max-w-6xl flex-col gap-sm px-xl py-xl text-xs text-tertiary sm:flex-row sm:items-center sm:justify-between">
+          <span>Total Recall · bilateral credit on Walrus Memory + Sui</span>
+          <span className="font-mono text-[10px]">
+            {state?.namespace ?? 'credit-demo'} · {state?.mode === 'live' ? 'mainnet relayer' : 'mock'} · base limit 10
+          </span>
+        </div>
+      </footer>
     </div>
   )
 }
