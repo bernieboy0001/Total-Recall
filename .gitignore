@@ -5,6 +5,8 @@ dist/
 # agents write .env files into the project when asked to configure things.
 .env
 .env.*
+# but a ready-made, secret-free example is meant to be shared:
+!.env.example
 # AI Builder's own files — not part of the app's source.
 # .claude/ and .mcp.json are deliberately NOT listed: they carry the Tatum skills
 # and the docs MCP server so an export keeps working in an external agent.
