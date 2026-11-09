@@ -192,6 +192,7 @@ Sui payment rail, verified on testnet:
 - Tatum's Sui gateways are GraphQL-only (`sui-testnet.gateway.tatum.io/graphql`) — `sui-payment.mjs` uses `SuiGraphQLClient` against it; `suix_*` JSON-RPC returns 404 there
 - Testnet agent wallet holds SUI (faucet-funded); balances render correctly via Tatum
 - `POST /api/payment/authorize` (ALLOW case) → `mode: dry-run`, Tatum simulateTransaction returned `success: true` (~0.002 SUI gas)
+- `POST /api/payment/execute` → **real on-chain testnet transfer of 0.01 SUI** via Tatum (digest `6Lybb7KH5o12ouSSXPzXySLBHp4X9bSiRD2kuqMgMVvT`, `effects.status = SUCCESS` — verified on testnet GraphQL), followed by an `advance` memory written back to Walrus in the same flow
 - Restart-verifiability and all other verified flows remain as described above
 
 Note: seeding is idempotent (dedupe + idempotency keys), so re-calling `/api/credit/seed` never duplicates.
