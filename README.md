@@ -70,7 +70,7 @@ Copy `.env.example` to `.env` (git-ignored) or export in the shell.
 | `MEMWAL_PRIVATE_KEY` | live memory | Delegate key (signs Walrus writes) |
 | `MEMWAL_MODE` | — | `auto` (default) · `mock` · `live` |
 | `MEMWAL_NAMESPACE` | — | Default `credit-demo` |
-| `MEMWAL_SERVER_URL` | — | Default `https://relayer.memory.walrus.xyz` |
+| `MEMWAL_SERVER_URL` | — | Default `https://relayer.memory.walrus.xyz` (mainnet). Testnet relayer: `https://relayer.dev.memwal.ai` |
 | `MEMWAL_RECALL_LIMIT` | — | Default `100` |
 | `TATUM_API_KEY` | payment dry-run / execute | `x-api-key` for the Tatum gateway |
 | `SUI_AGENT_PRIVATE_KEY` | payment | Hex64 or `suiprivkey1…` (agent wallet) |
@@ -80,6 +80,19 @@ Copy `.env.example` to `.env` (git-ignored) or export in the shell.
 | `PAYMENT_COIN_TYPE` / `PAYMENT_COIN_DECIMALS` / `PAYMENT_SYMBOL` | — | Defaults `0x2::sui::SUI` / 9 / `SUI` |
 | `PAYMENT_GAS_BUDGET_MIST` | — | Default `10000000` |
 | `PORT` | — | Default `3000` |
+
+### Networks
+
+| Layer | Production (mainnet) | Testnet |
+| --- | --- | --- |
+| Walrus Memory relayer | `https://relayer.memory.walrus.xyz` | `https://relayer.dev.memwal.ai` |
+| MemWalAccount | Your mainnet account + delegate key | Separate testnet account + delegate key |
+| Payment gateway | `https://sui-mainnet.gateway.tatum.io` | `https://sui-testnet.gateway.tatum.io` |
+| Explorer | `https://suiscan.xyz/mainnet` | `https://suiscan.xyz/testnet` |
+| Gas | Real SUI | Testnet SUI from the https://faucet.sui.io faucet |
+
+Networks do not mix: a mainnet MemWalAccount rejects staging credentials and vice-versa. When
+`SUI_NETWORK=testnet`, the payment rail uses the testnet Tatum gateway and testnet explorer links.
 
 ### Go live with Walrus Memory
 
