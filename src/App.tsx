@@ -870,7 +870,13 @@ export function App() {
                 <div className="mt-md space-y-sm text-sm">
                   <div className="flex items-center justify-between gap-md border-b border-white/10 pb-sm">
                     <span className="text-white/50">Mode</span>
-                    <span className="font-medium">{state?.mode === 'live' ? 'Walrus mainnet' : 'In-process mock'}</span>
+                    <span className="font-medium">
+                      {state?.mode === 'live'
+                        ? state.relayer?.includes('dev.memwal.ai')
+                          ? 'Walrus testnet'
+                          : 'Walrus mainnet'
+                        : 'In-process mock'}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between gap-md border-b border-white/10 pb-sm">
                     <span className="text-white/50">Relayer</span>
@@ -1635,7 +1641,13 @@ export function App() {
         <div className="mx-auto flex max-w-6xl flex-col gap-sm px-xl py-xl text-xs text-tertiary sm:flex-row sm:items-center sm:justify-between">
           <span>Total Recall · bilateral credit on Walrus Memory + Sui</span>
           <span className="font-mono text-[10px]">
-            {state?.namespace ?? 'credit-demo'} · {state?.mode === 'live' ? 'mainnet relayer' : 'mock'} · base limit 10
+            {state?.namespace ?? 'credit-demo'} ·{' '}
+            {state?.mode === 'live'
+              ? state.relayer?.includes('dev.memwal.ai')
+                ? 'testnet relayer'
+                : 'mainnet relayer'
+              : 'mock'}{' '}
+            · base limit 10
           </span>
         </div>
       </footer>
