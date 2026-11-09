@@ -181,6 +181,12 @@ Live Walrus (mainnet, namespace `credit-demo`):
 - `GET /api/credit/state` → 15 memories, limits `39.0 / 1.5`, fingerprint `234d408f627f42c6…`
 - Killed and restarted the backend → same 15 blobs recalled, **identical fingerprint**, same limits — the core "rebuilt from Walrus" claim
 
+Live Walrus (testnet relayer, namespace `credit-demo`, testnet MemWalAccount):
+
+- Seeded the 15 memories; same limits `39.0 / 1.5`
+- Fingerprint `21468161e66a357b…` — stable across a backend restart
+- Payment rail runs against `https://sui-testnet.gateway.tatum.io`; needs `TATUM_API_KEY` for dry-run/execute and testnet SUI for the agent wallet
+
 Note: seeding is idempotent (dedupe + idempotency keys), so re-calling `/api/credit/seed` never duplicates.
 The seed handler runs to completion server-side even if your HTTP client disconnects — re-read
 `/api/credit/state` before retrying.
