@@ -15,6 +15,7 @@ import path from 'path'
 import tatumRoutes from './routes/tatum.mjs'
 import creditRoutes from './routes/credit.mjs'
 import paymentRoutes from './routes/payment.mjs'
+import agentRoutes from './routes/agent.mjs'
 import { credentialGuard } from './credential-guard.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -35,6 +36,7 @@ app.use(credentialGuard)
 app.use('/api/tatum', tatumRoutes)
 app.use('/api/credit', creditRoutes)
 app.use('/api/payment', paymentRoutes)
+app.use('/api/agent', agentRoutes)
 
 // API errors stay JSON — Vite's dev middleware would otherwise turn a rejected
 // route into an HTML error page the dashboard cannot parse.

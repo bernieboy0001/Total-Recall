@@ -195,6 +195,61 @@ export interface PaymentExecution {
   error?: string
 }
 
+export type AgentRail = 'none' | 'dry-run' | 'execute'
+
+export interface AgentResponse {
+  agent: true
+  direction: Direction
+  label: string
+  lender: Party
+  borrower: Party
+  requestedAmount: number
+  purpose: string
+  paymentAmount: number
+  maxRelease: number
+  symbol: string
+  network: string
+  rail: AgentRail
+  verdict: Verdict
+  reason: string
+  limit: number
+  autoApproved: boolean
+  released: boolean
+  decision: Partial<Decision>
+  payment: {
+    mode: 'authorization-only' | 'dry-run' | 'execution'
+    configured: boolean
+    message?: string
+    digest?: string | null
+    explorerUrl?: string | null
+    dryRun?: {
+      status: string
+      success: boolean
+      error: unknown
+      digest?: string | null
+      gasUsed?: unknown
+      balanceChanges?: unknown
+    }
+    execution?: {
+      status: string
+      success: boolean
+      error: unknown
+      digest?: string | null
+      effects?: unknown
+      balanceChanges?: unknown
+    } | null
+    symbol?: string
+    amount?: number
+  } | null
+  memory: { blobId: string; text: string } | null
+  memoryError: string | null
+  memoryCount: number
+  fingerprint: { short: string; full: string }
+  limits?: { alice_to_bob: number; bob_to_alice: number }
+  limitAfter?: number
+  deferReason?: string | null
+}
+
 export interface RecordResponse {
   memory: { blobId: string; text: string }
   state: {
@@ -273,6 +328,11 @@ export const api = {
     }>('/api/credit/verify', {
       method: 'POST',
       body: JSON.stringify({ fingerprint }),
+    }),
+  agentRequest: (input: { direction: Direction; amount: number; purpose: string; rail: AgentRail; maxRelease?: number }) =>
+    request<AgentResponse>('/api/agent/request', {
+      method: 'POST',
+      body: JSON.stringify(input),
     }),
   authorizePayment: (input: { direction: Direction; requestedAmount: number; purpose: string }) =>
     request<PaymentAuthorization>('/api/payment/authorize', {

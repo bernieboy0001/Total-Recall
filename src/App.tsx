@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ArrowRight,
   ArrowRightLeft,
+  Bot,
   Brain,
   Check,
   CheckCircle2,
@@ -25,6 +26,8 @@ import {
 } from 'lucide-react'
 import {
   api,
+  type AgentRail,
+  type AgentResponse,
   type AppStatus,
   type BreakdownItem,
   type CreditState,
@@ -38,7 +41,7 @@ import {
   type Verdict,
 } from './lib/api'
 
-type Tab = 'dashboard' | 'request' | 'decision' | 'history'
+type Tab = 'dashboard' | 'request' | 'decision' | 'agent' | 'history'
 
 // Credit amounts are denominated in the same unit the agent rail moves.
 const CREDIT_UNIT = 'SUI'
@@ -389,6 +392,11 @@ export function App() {
   const [history, setHistory] = useState<HistoryResponse | null>(null)
   const [historyFilter, setHistoryFilter] = useState<string>('all')
   const [decision, setDecision] = useState<Decision | null>(null)
+  const [agentDirection, setAgentDirection] = useState<Direction>('alice_to_bob')
+  const [agentAmount, setAgentAmount] = useState('10')
+  const [agentPurpose, setAgentPurpose] = useState('Agent: working capital top-up')
+  const [agentRail, setAgentRail] = useState<AgentRail>('dry-run')
+  const [agentResult, setAgentResult] = useState<AgentResponse | null>(null)
   const [paymentAuth, setPaymentAuth] = useState<PaymentAuthorization | null>(null)
   const [paymentExec, setPaymentExec] = useState<PaymentExecution | null>(null)
   const [outcomeNote, setOutcomeNote] = useState('')
@@ -480,6 +488,46 @@ export function App() {
       )
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const handleAgentRun = async (event: React.FormEvent) => {
+    event.preventDefault()
+    clearAlerts()
+    const amount = Number(agentAmount)
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setError('Enter a positive amount.')
+      return
+    }
+    setBusy('agent-run')
+    try {
+      const result = await api.agentRequest({
+        direction: agentDirection,
+        amount,
+        purpose: agentPurpose,
+        rail: agentRail,
+      })
+      setAgentResult(result)
+      if (result.released) {
+        setNotice(
+          `Agent released ${result.paymentAmount} ${result.symbol} on testnet${
+            result.payment?.digest ? ` · tx ${result.payment.digest.slice(0, 10)}…` : ''
+          }. Advance remembered.`,
+        )
+      } else if (result.autoApproved) {
+        setNotice(
+          agentRail === 'none'
+            ? 'Agent approved. No payment rail requested — decision only.'
+            : 'Agent approved and verified via Tatum dry-run. No funds moved (dry-run).',
+        )
+      } else {
+        setNotice(`Agent deferred — no release. ${result.deferReason ?? result.reason}`)
+      }
+      await Promise.all([loadState(true), loadHistory(historyFilter)])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(null)
     }
   }
 
@@ -662,6 +710,7 @@ export function App() {
     { id: 'dashboard', label: 'Overview', icon: <Coins className="size-4" /> },
     { id: 'request', label: 'Request credit', icon: <ArrowRightLeft className="size-4" /> },
     { id: 'decision', label: 'Decision', icon: <FileCheck2 className="size-4" /> },
+    { id: 'agent', label: 'Agent', icon: <Bot className="size-4" /> },
     { id: 'history', label: 'Memory ledger', icon: <History className="size-4" />, count: history?.namespaceTotal },
   ]
 
@@ -1478,6 +1527,382 @@ export function App() {
                   </button>
                 </div>
               </>
+            )}
+          </div>
+        )}
+
+        {tab === 'agent' && (
+          <div className="mx-auto max-w-5xl space-y-xl">
+            <SectionHeading
+              eyebrow="Autonomous agent"
+              title="Agent mode — no human clicks “pay”"
+              action={
+                <Badge tone="brand" dot>
+                  Safety cap ≤ 0.05 {CREDIT_UNIT} per release
+                </Badge>
+              }
+            />
+
+            <section className="grid gap-xl lg:grid-cols-[0.95fr_1.05fr]">
+              <form onSubmit={handleAgentRun} className="space-y-lg rounded-2xl border border-secondary bg-primary p-2xl shadow-xs">
+                <div className="flex items-center gap-sm">
+                  <span className="flex size-9 items-center justify-center rounded-lg bg-utility-brand-50 text-utility-brand-700">
+                    <Bot className="size-5" />
+                  </span>
+                  <h3 className="text-heading-xs font-semibold text-primary">Run the agent</h3>
+                </div>
+                <p className="text-xs leading-5 text-tertiary">
+                  One command in, a policy-gated decision out. The agent recalls the namespace from Walrus,
+                  rebuilds the limit, and acts only when the evidence allows —
+                  it never overrides a REDUCE or BLOCK.
+                </p>
+
+                <fieldset>
+                  <legend className="text-sm font-medium text-secondary">Direction</legend>
+                  <div className="mt-sm grid grid-cols-2 gap-sm">
+                    {(['alice_to_bob', 'bob_to_alice'] as Direction[]).map(d => (
+                      <label
+                        key={d}
+                        className={`flex cursor-pointer items-center justify-between rounded-lg border p-md text-xs font-semibold transition-colors ${
+                          agentDirection === d
+                            ? 'border-brand bg-utility-brand-50 text-utility-brand-700'
+                            : 'border-secondary bg-primary text-secondary hover:bg-primary-hover'
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="agent-direction"
+                          value={d}
+                          checked={agentDirection === d}
+                          onChange={() => setAgentDirection(d)}
+                          className="sr-only"
+                        />
+                        {DIRECTION_LABEL[d]}
+                        {agentDirection === d && <Check className="size-4" />}
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+
+                <div>
+                  <label htmlFor="agent-amount" className="text-sm font-medium text-secondary">
+                    Requested amount ({CREDIT_UNIT})
+                  </label>
+                  <div className="mt-sm flex items-center rounded-lg border border-primary bg-primary focus-within:ring-2 focus-within:ring-focus-ring">
+                    <span className="pl-lg text-sm font-semibold text-tertiary">$</span>
+                    <input
+                      id="agent-amount"
+                      type="number"
+                      min="0.1"
+                      step="0.1"
+                      value={agentAmount}
+                      onChange={event => setAgentAmount(event.target.value)}
+                      className="w-full bg-transparent px-md py-lg text-heading-xs font-semibold text-primary outline-none tabular-nums"
+                      required
+                    />
+                    <span className="pr-lg text-xs font-medium text-tertiary">{CREDIT_UNIT}</span>
+                  </div>
+                  <div className="mt-sm flex flex-wrap gap-sm">
+                    {[1, 5, 10, 25].map(value => (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => setAgentAmount(String(value))}
+                        className={`rounded-full border px-md py-xxs text-xs font-semibold ${
+                          agentAmount === String(value)
+                            ? 'border-brand bg-utility-brand-50 text-utility-brand-700'
+                            : 'border-secondary text-tertiary hover:bg-primary-hover'
+                        }`}
+                      >
+                        {value}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <label htmlFor="agent-purpose" className="text-sm font-medium text-secondary">
+                    Purpose
+                  </label>
+                  <input
+                    id="agent-purpose"
+                    type="text"
+                    value={agentPurpose}
+                    onChange={event => setAgentPurpose(event.target.value)}
+                    className="mt-sm w-full rounded-lg border border-primary bg-primary px-lg py-md text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+                    placeholder="e.g. working capital top-up"
+                  />
+                </div>
+
+                <fieldset>
+                  <legend className="text-sm font-medium text-secondary">What should the agent do?</legend>
+                  <div className="mt-sm space-y-sm">
+                    {(
+                      [
+                        { value: 'dry-run', title: 'Approve + Tatum dry-run', hint: 'Safe — verifies the full rail, moves nothing' },
+                        { value: 'execute', title: 'Approve + release 0.01 SUI', hint: 'Real testnet transfer + memory written back' },
+                        { value: 'none', title: 'Approve only', hint: 'Policy verdict, no payment at all' },
+                      ] as Array<{ value: AgentRail; title: string; hint: string }>
+                    ).map(option => (
+                      <label
+                        key={option.value}
+                        className={`flex cursor-pointer items-start gap-md rounded-lg border p-md transition-colors ${
+                          agentRail === option.value
+                            ? 'border-brand bg-utility-brand-50'
+                            : 'border-secondary bg-primary hover:bg-primary-hover'
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="agent-rail"
+                          value={option.value}
+                          checked={agentRail === option.value}
+                          onChange={() => setAgentRail(option.value)}
+                          className="sr-only"
+                        />
+                        <span
+                          className={`mt-xxs flex size-4 shrink-0 items-center justify-center rounded-full border ${
+                            agentRail === option.value ? 'border-brand bg-primary' : 'border-primary bg-primary'
+                          }`}
+                        >
+                          {agentRail === option.value && <span className="size-2 rounded-full bg-brand-solid" />}
+                        </span>
+                        <span>
+                          <span className="block text-xs font-semibold text-primary">{option.title}</span>
+                          <span className="mt-xxs block text-[11px] text-tertiary">{option.hint}</span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+
+                <button
+                  type="submit"
+                  disabled={busy === 'agent-run'}
+                  className="inline-flex w-full items-center justify-center gap-sm rounded-lg bg-brand-solid px-lg py-lg text-sm font-semibold text-primary-on-brand hover:bg-brand-solid-hover disabled:opacity-60"
+                >
+                  {busy === 'agent-run' ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Bot className="size-4" />
+                  )}
+                  {agentRail === 'execute' ? 'Run agent — release on testnet' : 'Run agent'}
+                </button>
+              </form>
+
+              <div className="space-y-md">
+                <div className="rounded-2xl border border-secondary bg-secondary p-xl">
+                  <h3 className="text-sm font-semibold text-primary">What the agent enforces</h3>
+                  <ul className="mt-sm space-y-sm text-xs leading-5 text-secondary">
+                    <li className="flex items-start gap-sm">
+                      <ShieldCheck className="mt-0.5 size-4 shrink-0 text-fg-brand-primary" />
+                      Budget rebuilt from Walrus — never read from a database or cache.
+                    </li>
+                    <li className="flex items-start gap-sm">
+                      <Wallet className="mt-0.5 size-4 shrink-0 text-fg-brand-primary" />
+                      Hard cap {CREDIT_UNIT === 'SUI' ? '0.05 SUI' : '0.05'} per autonomous release, enforced on the server.
+                    </li>
+                    <li className="flex items-start gap-sm">
+                      <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-utility-success-600" />
+                      Only an ALLOW verdict triggers the Tatum dry-run / transfer path.
+                    </li>
+                    <li className="flex items-start gap-sm">
+                      <Lock className="mt-0.5 size-4 shrink-0 text-fg-quaternary" />
+                      REDUCE, BLOCK or missing evidence → defers to a human. No funds move.
+                    </li>
+                    <li className="flex items-start gap-sm">
+                      <Database className="mt-0.5 size-4 shrink-0 text-fg-brand-primary" />
+                      After a release, the advance is written back to Walrus so the next decision sees it.
+                    </li>
+                  </ul>
+                </div>
+
+                {agentResult && (
+                  <div className="rounded-2xl border border-utility-brand-200 bg-utility-brand-50 p-xl">
+                    <p className="text-[11px] font-semibold uppercase tracking-wider text-utility-brand-700">
+                      Last agent run
+                    </p>
+                    <p className="mt-xxs text-xs leading-5 text-utility-brand-700">
+                      {agentResult.released
+                        ? `Released ${agentResult.paymentAmount} ${agentResult.symbol} on ${agentResult.network} — digest ${agentResult.payment?.digest ?? 'n/a'}.`
+                        : agentResult.autoApproved
+                          ? `Approved (limit ${fmt(agentResult.limit)}) — ${
+                              agentResult.rail === 'none' ? 'no payment rail requested' : 'dry-run verified'
+                            }.`
+                          : `Deferred — everything needs a human. ${agentResult.deferReason ?? agentResult.reason}`}
+                    </p>
+                    <div className="mt-sm flex flex-wrap items-center gap-sm text-xs text-utility-brand-700">
+                      <VerdictBadge verdict={agentResult.verdict} />
+                      <span className="font-semibold tabular-nums">
+                        limit {fmt(agentResult.limit)} · memories {agentResult.memoryCount}
+                      </span>
+                      <span className="font-mono text-[10px]">#{agentResult.fingerprint.short}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </section>
+
+            {agentResult && (
+              <section className="rounded-2xl border border-secondary bg-primary p-2xl shadow-xs">
+                <div className="flex flex-col gap-md sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">Agent decision report</p>
+                    <h3 className="mt-xxs text-heading-xs font-semibold text-primary">
+                      {DIRECTION_LABEL[agentResult.direction]} · {agentResult.purpose}
+                    </h3>
+                  </div>
+                  <Badge tone={agentResult.released ? 'success' : agentResult.autoApproved ? 'brand' : 'warning'} dot>
+                    {agentResult.released
+                      ? 'Payment released'
+                      : agentResult.autoApproved
+                        ? agentResult.rail === 'none'
+                          ? 'Approved only'
+                          : 'Approved · dry-run'
+                        : 'Deferred to human'}
+                  </Badge>
+                </div>
+
+                <div className="mt-xl grid grid-cols-2 gap-md border-t border-black/5 pt-xl sm:grid-cols-5">
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wide text-tertiary">Verdict</p>
+                    <div className="mt-xxs"><VerdictBadge verdict={agentResult.verdict} /></div>
+                  </div>
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wide text-tertiary">Requested</p>
+                    <p className="mt-xxs text-lg font-semibold text-primary tabular-nums">{fmtAmount(agentResult.requestedAmount)}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wide text-tertiary">Reconstructed limit</p>
+                    <p className="mt-xxs text-lg font-semibold text-primary tabular-nums">{fmt(agentResult.limit)}</p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wide text-tertiary">Payment</p>
+                    <p className="mt-xxs text-lg font-semibold text-primary tabular-nums">
+                      {agentResult.paymentAmount} {agentResult.symbol}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wide text-tertiary">Limit after</p>
+                    <p className="mt-xxs text-lg font-semibold text-primary tabular-nums">
+                      {fmt(agentResult.limitAfter ?? agentResult.limit)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-xl grid gap-xl md:grid-cols-2">
+                  <div>
+                    <div className="flex items-center justify-between gap-sm">
+                      <div className="flex items-center gap-sm">
+                        <ShieldCheck className="size-4 text-fg-brand-primary" />
+                        <h4 className="text-sm font-semibold text-primary">Evidence used</h4>
+                      </div>
+                      <span className="text-xs text-tertiary">
+                        {agentResult.decision.relevant?.length ?? 0} recalled ·{' '}
+                        {agentResult.decision.breakdown?.length ?? 0} scored
+                      </span>
+                    </div>
+                    <ul className="mt-md max-h-72 space-y-sm overflow-y-auto">
+                      {(agentResult.decision.relevant ?? []).length === 0 && (
+                        <li className="rounded-xl bg-secondary p-lg text-center text-xs text-tertiary">
+                          No evidence — base-10 policy applied.
+                        </li>
+                      )}
+                      {(agentResult.decision.relevant ?? [])
+                        .slice()
+                        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+                        .slice(0, 12)
+                        .map(item => {
+                          const scored = (agentResult.decision.breakdown ?? []).find(b => b.blobId === item.blobId)
+                          return <MemoryRow key={item.id} interaction={item} delta={scored?.delta} compact />
+                        })}
+                    </ul>
+                  </div>
+
+                  <div className="space-y-md">
+                    {agentResult.payment && (
+                      <div className="rounded-xl border border-secondary bg-secondary p-lg">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-tertiary">Payment rail</p>
+                        <div className="mt-xs flex items-center justify-between gap-sm">
+                          <span className="text-xs text-secondary">Mode</span>
+                          <Badge tone={agentResult.payment?.mode === 'execution' ? 'success' : 'brand'}>
+                            {agentResult.payment?.mode === 'execution' ? 'Executed on testnet' : 'Tatum dry-run'}
+                          </Badge>
+                        </div>
+                        <div className="mt-xs flex items-center justify-between gap-sm">
+                          <span className="text-xs text-secondary">Amount</span>
+                          <span className="text-xs font-semibold text-primary">
+                            {agentResult.paymentAmount} {agentResult.symbol}
+                          </span>
+                        </div>
+                        {agentResult.payment?.dryRun && (
+                          <div className="mt-xs flex items-center justify-between gap-sm">
+                            <span className="text-xs text-secondary">Tatum simulation</span>
+                            <span className={`text-xs font-semibold ${agentResult.payment.dryRun.success ? 'text-utility-success-700' : 'text-utility-error-700'}`}>
+                              {agentResult.payment.dryRun.status}
+                            </span>
+                          </div>
+                        )}
+                        {agentResult.payment?.digest && (
+                          <div className="mt-xs flex items-center justify-between gap-sm">
+                            <span className="text-xs text-secondary">Digest</span>
+                            <div className="flex items-center gap-xs">
+                              <span className="font-mono text-[10px] text-primary">{shortBlob(agentResult.payment.digest)}</span>
+                              <CopyButton value={agentResult.payment.digest} label="Digest" />
+                            </div>
+                          </div>
+                        )}
+                        {agentResult.payment?.explorerUrl && (
+                          <a
+                            href={agentResult.payment.explorerUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="mt-sm inline-flex items-center gap-xs text-xs font-semibold text-utility-brand-700 underline"
+                          >
+                            View on suiscan <ArrowRight className="size-3.5" />
+                          </a>
+                        )}
+                        {agentResult.payment?.message && (
+                          <p className="mt-xs text-[11px] text-utility-warning-700">{agentResult.payment.message}</p>
+                        )}
+                      </div>
+                    )}
+
+                    {agentResult.memory && (
+                      <div className="rounded-xl border border-utility-success-200 bg-utility-success-50 p-lg">
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-utility-success-700">
+                          Advance written back to Walrus
+                        </p>
+                        <div className="mt-xs flex items-center justify-between gap-sm">
+                          <span className="font-mono text-[11px] text-utility-success-700">
+                            {shortBlob(agentResult.memory.blobId)}
+                          </span>
+                          <CopyButton value={agentResult.memory.blobId} label="Blob ID" />
+                        </div>
+                        <p className="mt-xs truncate text-[10px] text-utility-success-700/90">
+                          {agentResult.memory.text}
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="rounded-xl bg-secondary p-lg">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-tertiary">Rule trace</p>
+                      <p className="mt-xxs font-mono text-[11px] leading-5 text-secondary">
+                        limit = 10 + repayments − defaults − drawdowns + recency ={' '}
+                        <span className="font-semibold text-primary">{fmt(agentResult.decision?.memoryOn?.limit ?? agentResult.limit)}</span>
+                        {' · verdict: '}
+                        {agentResult.verdict}
+                        {' → released: '}
+                        {agentResult.released ? 'yes' : 'no'}
+                      </p>
+                      <p className="mt-xxs text-[11px] leading-5 text-tertiary">
+                        Agent never releases above the reconstructed limit or the 0.05 {CREDIT_UNIT} hard cap.
+                        Evidence is whatever Walrus recalled for this namespace — nothing else.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </section>
             )}
           </div>
         )}

@@ -148,10 +148,34 @@ is not `ALLOW`; **503** when the key wallet is unconfigured.
 > `POST /api/credit/reset-mock` restores the 15-seed state; in live mode, either use a fresh
 > namespace (`MEMWAL_NAMESPACE=credit-demo-2`) or accept the extra evidence as part of the demo.
 
+## Agent mode
+
+`POST /api/agent/request` lets an unattended agent request and (inside a hard cap) release
+against the same Walrus-rebuilt policy a human sees — no human click required:
+
+```
+{ "direction": "alice_to_bob", "amount": 10, "purpose": "Agent: top-up", "rail": "dry-run" }
+```
+
+Flow: recall → compute limit → `verdict`. Only **ALLOW** proceeds to the rail:
+
+| `rail` | Effect |
+| --- | --- |
+| `none` | Verdict only, nothing moves |
+| `dry-run` (default) | Tatum `simulateTransaction` — verifies the full rail, moves nothing |
+| `execute` | Real `executeTransaction` of the tiny agent payment, then an `advance` memory written back |
+
+Hard safety cap: `AGENT_MAX_RELEASE` (default **0.05**) — releases above it are refused with 403,
+and REDUCE/BLOCK defer to a human with no movement. Agent decisions return the same evidence,
+fingerprint and memories the Decision tab shows.
+
+UI: the **Agent** tab runs exactly this flow and displays what the agent saw (evidence, verdict, dry-run/digest, memory write).
+
 ## API
 
 | Route | Purpose |
 | --- | --- |
+| `POST /api/agent/request` | Agent: recall → gate (cap) → dry-run/execute → write memory |
 | `GET /api/credit/state?memory=on\|off` | Limits, directions, evidence, fingerprint |
 | `POST /api/credit/evaluate` | `{direction, amount, purpose, memory}` → Decision |
 | `GET /api/credit/history?type=all\|repayment\|…` | Ledger (all or last 20 with type filter) |
@@ -184,8 +208,8 @@ Live Walrus (mainnet, namespace `credit-demo`):
 Live Walrus (testnet relayer, namespace `credit-demo`, testnet MemWalAccount):
 
 - `POST /api/credit/seed` → 15 real testnet blobs; limits `39.0 / 1.5`
-- Fingerprint `21468161e66a357b…` — identical across a backend kill+restart
-- Memory writes, decisions, ledger and fingerprint flows all behave identically to mainnet
+- Fingerprint `21468161e66a357b…` — stable across a backend kill+restart (now 16 after one guided agent-payment release)
+- `POST /api/agent/request` verified end-to-end: ALLOW + Tatum dry-run success, BLOCK→defer no movement, cap enforced
 
 Sui payment rail, verified on testnet:
 

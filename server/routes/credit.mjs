@@ -1,5 +1,4 @@
 import { Router } from 'express'
-import { createHash } from 'node:crypto'
 import {
   evaluateRequest,
   computeState,
@@ -11,19 +10,10 @@ import { serializeInteraction } from '../credit/schema.mjs'
 import { recallAll, rememberInteraction, seedMemories, memoryStatus, isMock, memoryConfig } from '../memory.mjs'
 import { paymentConfig, getBalances } from '../sui-payment.mjs'
 import { tatumApiBase } from '../tatum-client.mjs'
+import { fingerprint } from '../fingerprint.mjs'
 
 const router = Router()
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
-
-function fingerprint(interactions) {
-  const canonical = interactions
-    .slice()
-    .sort((a, b) => String(a.blobId ?? a.id).localeCompare(String(b.blobId ?? b.id)))
-    .map(i => `${i.blobId ?? i.id}\n${i.text}`)
-    .join('\n')
-  const full = createHash('sha256').update(canonical, 'utf8').digest('hex')
-  return { short: full.slice(0, 16), full }
-}
 
 async function buildStatePayload(memoryEnabled) {
   const recall = await recallAll()
