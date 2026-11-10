@@ -6,17 +6,12 @@ import './proxy-bootstrap.mjs'
 // the key arrives as a file rather than an env var, and stays current when it
 // changes. A no-op where the key is already in env.
 import './credentials-store.mjs'
-import express from 'express'
 import { createServer as createHttpServer } from 'http'
 import { createServer as createViteServer } from 'vite'
 import react from '@vitejs/plugin-react'
 import { fileURLToPath } from 'url'
 import path from 'path'
-import tatumRoutes from './routes/tatum.mjs'
-import creditRoutes from './routes/credit.mjs'
-import paymentRoutes from './routes/payment.mjs'
-import agentRoutes from './routes/agent.mjs'
-import { credentialGuard } from './credential-guard.mjs'
+import app from './app.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const root = path.join(__dirname, '..')
@@ -26,31 +21,6 @@ const root = path.join(__dirname, '..')
 // globs — must see the project files, or it silently generates no utilities
 // (unstyled preview). `vite build` already runs from here; this makes dev match.
 process.chdir(root)
-
-const app = express()
-app.use(express.json())
-
-// Redact the Tatum API key from every response before it leaves the process.
-app.use(credentialGuard)
-
-app.use('/api/tatum', tatumRoutes)
-app.use('/api/credit', creditRoutes)
-app.use('/api/payment', paymentRoutes)
-app.use('/api/agent', agentRoutes)
-
-// API errors stay JSON — Vite's dev middleware would otherwise turn a rejected
-// route into an HTML error page the dashboard cannot parse.
-app.use('/api', (error, _req, res, _next) => {
-  if (res.headersSent) return
-  const status =
-    error?.status ??
-    (error?.name === 'MissingApiKeyError' || error?.name === 'PaymentNotConfiguredError' ? 503 : 500)
-  console.error(`[api] ${error?.name ?? 'Error'}: ${error?.message ?? error}`)
-  res.status(status).json({
-    error: error?.message ?? 'Unexpected server error',
-    code: error?.name ?? 'Error',
-  })
-})
 
 const server = createHttpServer(app)
 
